@@ -2,7 +2,7 @@
 //! and Groq preferences for PdfCraft, modeled after the books assistant.
 //!
 //! Provides:
-//! - Docked right side panel (RightPanel::Ai) matching the books reader.
+//! - Docked right side panel matching the books reader.
 //! - 💬 **Chat Tab:** Context-aware conversations with sanitized PDF excerpts,
 //!   rich Markdown rendering, mathematical symbols/LaTeX equations, tables,
 //!   stop-generation controls, and instant model switching.
@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use egui::{Align, Align2, Color32, CornerRadius, Layout, Margin, Response, Stroke, Vec2, vec2};
+use egui::{Align, Color32, CornerRadius, Layout, Margin, Response, Stroke, vec2};
 use pdfcraft_ai::{strip_thinking_blocks, AiEvent, KeyPool, Message};
 use serde::{Deserialize, Serialize};
 
 use crate::theme::{self, Tokens};
-use crate::{PdfCraftApp, RightPanel, icons, widgets};
+use crate::{PdfCraftApp, icons};
 
 // ---------------------------------------------------------------------------
 // Text Sanitization & LaTeX Math Preprocessor
@@ -495,22 +495,23 @@ impl AiState {
             .trim()
             .to_string();
 
-        let value_res: Result<serde_json::Value, _> = serde_json::from_str(&stripped)
+        let value_res: Result<serde_json::Value, String> = serde_json::from_str(&stripped)
+            .map_err(|e| e.to_string())
             .or_else(|_| {
                 if let (Some(s), Some(e)) = (stripped.find('{'), stripped.rfind('}')) {
                     if e > s {
-                        serde_json::from_str(&stripped[s..=e])
+                        serde_json::from_str(&stripped[s..=e]).map_err(|e| e.to_string())
                     } else {
-                        Err(serde_json::Error::custom("no json object found"))
+                        Err("no json object found".to_string())
                     }
                 } else if let (Some(s), Some(e)) = (stripped.find('['), stripped.rfind(']')) {
                     if e > s {
-                        serde_json::from_str(&stripped[s..=e])
+                        serde_json::from_str(&stripped[s..=e]).map_err(|e| e.to_string())
                     } else {
-                        Err(serde_json::Error::custom("no json array found"))
+                        Err("no json array found".to_string())
                     }
                 } else {
-                    Err(serde_json::Error::custom("no json delimiters"))
+                    Err("no json delimiters".to_string())
                 }
             });
 
@@ -603,7 +604,7 @@ impl AiState {
             "You are an expert academic and educational summarizer.\
              Summarize the following PDF excerpt thoroughly, accurately, and concisely.\n\
              Structure your response with:\n\
-             1. **Executive Overview (نظرة عامة شملة)**\n\
+             1. **Executive Overview (نظرة عامة شاملة)**\n\
              2. **Key Concepts & Definitions (المفاهيم والتعاريف الأساسية)**\n\
              3. **High-Yield Takeaways (أهم النقاط والاستنتاجات)**\n\n\
              Text:\n{extracted_text}"
@@ -818,7 +819,7 @@ pub fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, t: &Tokens) {
                         ui.label(egui::RichText::new("Code").small().color(t.text_faint));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.small_button("📋 Copy").clicked() {
-                                ui.ctx().output_mut(|o| o.copied_text = code_to_copy);
+                                ui.ctx().copy_text(code_to_copy);
                             }
                         });
                     });
@@ -847,7 +848,7 @@ pub fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, t: &Tokens) {
             continue;
         }
         if let Some(h) = line.strip_prefix("# ") {
-            ui.label(egui::RichText::new(h).font(theme::bold(16.0)).color(t.accent));
+            ui.label(egui::RichText::new(h).font(theme::semibold(16.0)).color(t.accent));
             ui.add_space(4.0);
             i += 1;
             continue;
@@ -856,7 +857,7 @@ pub fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, t: &Tokens) {
         // 5. Bullet Lists
         if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("•").color(t.accent).font(theme::bold(13.0)));
+                ui.label(egui::RichText::new("•").color(t.accent).font(theme::semibold(13.0)));
                 render_inline_spans(ui, item, t);
             });
             ui.add_space(1.0);
@@ -930,7 +931,7 @@ fn render_markdown_table(ui: &mut egui::Ui, lines: &[&str], t: &Tokens) {
                 ui.label(egui::RichText::new("Table").small().font(theme::semibold(11.0)).color(t.accent));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("📋 Copy Table").clicked() {
-                        ui.ctx().output_mut(|o| o.copied_text = table_raw);
+                        ui.ctx().copy_text(table_raw);
                     }
                 });
             });
@@ -1021,7 +1022,7 @@ pub fn extract_document_text(app: &mut PdfCraftApp, start_page: usize, end_page:
         return Err("No active PDF document open".to_string());
     };
     let view = &mut app.views[index];
-    let total_pages = view.page_count;
+    let total_pages = view.page_count();
 
     if total_pages == 0 {
         return Err("Document is empty".to_string());
@@ -1031,24 +1032,12 @@ pub fn extract_document_text(app: &mut PdfCraftApp, start_page: usize, end_page:
     let e = end_page.max(s).min(total_pages);
 
     let mut combined = String::new();
-    let mut renderer = pdfcraft_render::PageRenderer::new();
 
     for p in s..=e {
         let page_index = p - 1;
         if let Some(text_layer) = view.texts.get(&page_index) {
             combined.push_str(&text_layer.plain_text());
             combined.push('\n');
-        } else {
-            let req = pdfcraft_render::RenderRequest {
-                doc: view.id,
-                page: page_index,
-                kind: pdfcraft_render::RequestKind::Text,
-                size: [100, 100],
-            };
-            if let Ok(pdfcraft_render::RenderOutput::Text(t)) = renderer.render(req, &app.session) {
-                combined.push_str(&t.plain_text());
-                combined.push('\n');
-            }
         }
     }
 
@@ -1150,7 +1139,9 @@ pub fn render_right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     ui.add_space(2.0);
 
     // Error banner if any
+    let mut clear_error = false;
     if let Some(err) = &app.ai.error {
+        let err_text = err.clone();
         egui::Frame::new()
             .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 25))
             .stroke(Stroke::new(1.0, danger_color(&t)))
@@ -1159,15 +1150,18 @@ pub fn render_right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(icons::image("alert-circle", 14.0, danger_color(&t)));
-                    ui.label(egui::RichText::new(err).small().color(danger_color(&t)));
+                    ui.label(egui::RichText::new(&err_text).small().color(danger_color(&t)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("✕").clicked() {
-                            app.ai.error = None;
+                            clear_error = true;
                         }
                     });
                 });
             });
         ui.add_space(4.0);
+    }
+    if clear_error {
+        app.ai.error = None;
     }
 
     // 2. Dispatch Active Tab
@@ -1285,7 +1279,7 @@ fn render_chat_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
             app.ai.submit_prompt(&pool, &draft);
         }
 
-        let send_btn = egui::Button::new(egui::RichText::new("➤").font(theme::bold(14.0)))
+        let send_btn = egui::Button::new(egui::RichText::new("➤").font(theme::semibold(14.0)))
             .min_size(vec2(32.0, 32.0));
 
         if ui.add_enabled(!is_loading && !app.ai.draft.trim().is_empty(), send_btn).clicked() {
@@ -1324,7 +1318,7 @@ fn render_chat_bubble(ui: &mut egui::Ui, msg: &Message, t: &Tokens) {
                     ui.label(egui::RichText::new("Assistant").small().font(theme::semibold(11.0)).color(t.accent));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("📋").on_hover_text("Copy message").clicked() {
-                            ui.ctx().output_mut(|o| o.copied_text = copy_content);
+                            ui.ctx().copy_text(copy_content);
                         }
                     });
                 });
@@ -1339,7 +1333,7 @@ fn render_chat_bubble(ui: &mut egui::Ui, msg: &Message, t: &Tokens) {
 // ---------------------------------------------------------------------------
 
 fn render_summary_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    let active_pages = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.page_count);
+    let active_pages = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.page_count());
 
     // Page Range & Dual Mode Trigger Controls
     egui::Frame::new()
@@ -1422,7 +1416,7 @@ fn render_summary_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
                     app.ai.summary_result.clear();
                 }
                 if ui.small_button("📋 Copy All").clicked() {
-                    ui.ctx().output_mut(|o| o.copied_text = app.ai.summary_result.clone());
+                    ui.ctx().copy_text(app.ai.summary_result.clone());
                 }
             });
         });
@@ -1498,7 +1492,7 @@ fn render_quiz_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
 }
 
 fn render_quiz_setup(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    let active_pages = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.page_count);
+    let active_pages = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.page_count());
 
     egui::Frame::new()
         .fill(t.hover)
@@ -1666,7 +1660,7 @@ fn render_quiz_runner(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("[{letter}]")).font(theme::bold(12.5)).color(text_color));
+                    ui.label(egui::RichText::new(format!("[{letter}]")).font(theme::semibold(12.5)).color(text_color));
                     ui.label(egui::RichText::new(format!("{opt_text}{mark}")).font(theme::regular(13.0)).color(t.text));
                 });
             })
@@ -1774,7 +1768,7 @@ fn render_structured_explanation(ui: &mut egui::Ui, explanation: &str, t: &Token
             ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new(format!("[{first_char}]"))
-                        .font(theme::bold(12.0))
+                        .font(theme::semibold(12.0))
                         .color(badge_color),
                 );
                 let content = if line.len() > 2 {
@@ -1818,11 +1812,11 @@ fn render_quiz_score_card(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) 
             .inner_margin(Margin::same(16))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("🏆 Quiz Completed!").font(theme::bold(18.0)).color(t.accent));
+                ui.label(egui::RichText::new("🏆 Quiz Completed!").font(theme::semibold(18.0)).color(t.accent));
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(format!("{score} / {total} Correct ({percentage}%)"))
-                        .font(theme::bold(20.0))
+                        .font(theme::semibold(20.0))
                         .color(if percentage >= 70 { success_color(t) } else { t.text }),
                 );
                 ui.add_space(6.0);
@@ -1924,7 +1918,7 @@ fn render_quiz_review(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("Q{}: {}", idx + 1, q.question)).font(theme::semibold(13.0)).color(t.text));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(egui::RichText::new(card_mark).small().font(theme::bold(11.0)).color(card_border));
+                            ui.label(egui::RichText::new(card_mark).small().font(theme::semibold(11.0)).color(card_border));
                         });
                     });
 

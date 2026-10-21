@@ -504,6 +504,29 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let Some((index, id)) = app.active_ids() else { return };
     let Some(panel) = app.right else { return };
+    if panel == RightPanel::Ai {
+        let mut close = false;
+        egui::Frame::NONE
+            .fill(t.panel)
+            .inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 8 })
+            .stroke(Stroke::new(1.0, t.divider))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("✨ AI Assistant").font(theme::semibold(15.5)));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icons::button(ui, "x", 28.0, false, tl!("Close panel")).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                crate::ai_ui::render_right_panel(app, ui);
+            });
+        if close {
+            app.choose_right_panel(None);
+        }
+        return;
+    }
     let mut nav: Option<Nav> = None;
     let mut close = false;
     let mut toggle_layer: Option<(usize, bool)> = None;
@@ -641,11 +664,8 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         ancestor.pop();
                     }
                 }
-                if panel == RightPanel::Ai {
-                    crate::ai_ui::render_right_panel(app, ui);
-                } else {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
-                        RightPanel::Ai => {}
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match panel {
+                    RightPanel::Ai => {}
                         RightPanel::Comments => {
                         if let Some(e) = crate::comments_panel::show(ui, &t, info, view, prefs, comment_allowed, &mut nav) {
                             panel_edit = Some(e);
@@ -764,8 +784,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-            }
-        });
+            });
     }
     if close {
         app.choose_right_panel(None);

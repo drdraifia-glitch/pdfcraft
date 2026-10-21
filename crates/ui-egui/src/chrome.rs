@@ -655,6 +655,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     );
     let page_count = doc.info.pages.len();
     let labels: Vec<String> = doc.info.pages.iter().map(|p| p.label.clone()).collect();
+    let has_ai = !app.ai.history.is_empty() || app.ai.streaming.is_some();
     egui::Panel::right("rail")
         .resizable(false)
         .exact_size(48.0)
@@ -672,7 +673,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     app.choose_right_panel(if selected { None } else { Some(panel) });
                 }
             };
-            rail_button(ui, RightPanel::Ai, "sparkles", "✨ AI Assistant", !app.ai.history.is_empty() || app.ai.streaming.is_some());
+            rail_button(ui, RightPanel::Ai, "sparkles", "✨ AI Assistant", has_ai);
             rail_button(ui, RightPanel::Comments, "message-square-text", "Comments", has_comments);
             rail_button(ui, RightPanel::Bookmarks, "bookmark", "Bookmarks", has_outline);
             rail_button(ui, RightPanel::Pages, "files", "Page thumbnails", false);
