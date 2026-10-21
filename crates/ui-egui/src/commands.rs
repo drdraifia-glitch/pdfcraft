@@ -402,7 +402,7 @@ impl PdfCraftApp {
                 self.doc_js = Default::default();
                 self.dialog = Some(Dialog::DocumentJs);
             }
-            "tools.ai_assistant" => self.ai.open = !self.ai.open,
+            "tools.ai_assistant" => self.choose_right_panel(if self.right == Some(RightPanel::Ai) { None } else { Some(RightPanel::Ai) }),
             "app.preferences" => self.dialog = Some(Dialog::Preferences),
             "ocr.recognize_batch" => self.ocr_files_dialog(),
             "edit.edit_text" => {

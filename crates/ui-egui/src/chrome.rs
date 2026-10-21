@@ -296,8 +296,8 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         });
                     }
                     egui::Popup::context_menu(&response).id(response.id.with("theme_menu")).show(|ui| appearance_menu(app, ui));
-                    if icons::button(ui, "sparkles", button, app.ai.open, "Ask AI Assistant").clicked() {
-                        app.ai.open = !app.ai.open;
+                    if icons::button(ui, "sparkles", button, app.right == Some(RightPanel::Ai), "✨ AI Assistant").clicked() {
+                        app.choose_right_panel(if app.right == Some(RightPanel::Ai) { None } else { Some(RightPanel::Ai) });
                     }
                     if icons::button(ui, "circle-help", button, false, tl!("Keyboard shortcuts")).clicked() {
                         app.dialog = Some(Dialog::Shortcuts);
@@ -606,7 +606,7 @@ fn main_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     crate::commands::registry_menu(app, ui, "View");
                     ui.separator();
                     if ui.button(tl!("✨ Ask AI Assistant")).clicked() {
-                        app.ai.open = !app.ai.open;
+                        app.choose_right_panel(Some(RightPanel::Ai));
                         ui.close();
                     }
                     ui.separator();
@@ -614,6 +614,7 @@ fn main_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     ui.menu_button(tl!("Side panels"), |ui| {
                         scroll_menu(ui, |ui| {
                             for (p, label) in [
+                                (RightPanel::Ai, tl!("✨ AI Assistant")),
                                 (RightPanel::Comments, tl!("Comments")),
                                 (RightPanel::Bookmarks, tl!("Bookmarks")),
                                 (RightPanel::Pages, tl!("Pages")),
@@ -671,6 +672,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     app.choose_right_panel(if selected { None } else { Some(panel) });
                 }
             };
+            rail_button(ui, RightPanel::Ai, "sparkles", "✨ AI Assistant", !app.ai.history.is_empty() || app.ai.streaming.is_some());
             rail_button(ui, RightPanel::Comments, "message-square-text", "Comments", has_comments);
             rail_button(ui, RightPanel::Bookmarks, "bookmark", "Bookmarks", has_outline);
             rail_button(ui, RightPanel::Pages, "files", "Page thumbnails", false);

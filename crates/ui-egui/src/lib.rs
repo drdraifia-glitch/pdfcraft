@@ -193,6 +193,7 @@ pub enum LeftPanel {
 /// Right-hand panels, opened from the rail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RightPanel {
+    Ai,
     Comments,
     Bookmarks,
     Pages,
@@ -2521,6 +2522,7 @@ impl PdfCraftApp {
             }
             ("panel", _) => {
                 self.right = match value {
+                    "ai" => Some(RightPanel::Ai),
                     "comments" => Some(RightPanel::Comments),
                     "bookmarks" => Some(RightPanel::Bookmarks),
                     "pages" => Some(RightPanel::Pages),
@@ -3187,10 +3189,15 @@ impl eframe::App for PdfCraftApp {
             // there, so its buttons (Bookmarks, Page thumbnails, ...) must open their panels.
             // Outside Read mode the docking workspace draws the inspector.
             if self.mode == Mode::Read && self.right.is_some() {
+                let (default_w, max_w) = if self.right == Some(RightPanel::Ai) {
+                    (400.0, 650.0)
+                } else {
+                    (330.0, 520.0)
+                };
                 egui::Panel::right("read_right_panel")
                     .resizable(true)
-                    .default_size(330.0)
-                    .size_range(260.0..=520.0)
+                    .default_size(default_w)
+                    .size_range(280.0..=max_w)
                     .frame(egui::Frame::NONE)
                     .show(ui, |ui| panels::right_panel(self, ui));
             }

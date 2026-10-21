@@ -4074,7 +4074,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
         run_button(app, index, &name, action);
     }
     if let Some(text) = ask_ai_text {
-        app.ai.open_with_context(text);
+        let clean = crate::ai_ui::clean_and_sanitize_pdf_text(&text);
+        app.ai.open_with_context(clean);
+        app.choose_right_panel(Some(RightPanel::Ai));
     }
     if copy_selected {
         app.execute("edit.copy");

@@ -1,25 +1,152 @@
-//! AI assistant panel, document summarization, interactive QCMs/quiz generator,
-//! and Groq preferences for PdfCraft.
+//! AI assistant panel, document summarization, interactive QCM/Quiz runner,
+//! and Groq preferences for PdfCraft, modeled after the books assistant.
 //!
 //! Provides:
-//! - Floating multi-tab assistant window (Chat, Summary, QCM / Quiz).
-//! - 💬 **Chat Tab:** Context-aware conversations with selected PDF excerpts.
-//! - 📄 **Summary Tab:** Full document or page-range executive summaries and notes.
-//! - 🎯 **QCM / Quiz Tab:** Interactive clinical/academic QCM generator and grader
-//!   with custom question count, difficulty levels, instantaneous scoring, and
-//!   per-option explanations.
+//! - Docked right side panel (RightPanel::Ai) matching the books reader.
+//! - 💬 **Chat Tab:** Context-aware conversations with sanitized PDF excerpts,
+//!   rich Markdown rendering, mathematical symbols/LaTeX equations, and tables.
+//! - 📄 **Summary Tab:** Smart comparison tables and structured summaries
+//!   with custom page ranges (From page X to page Y).
+//! - 🎯 **QCM / Quiz Tab:** Interactive step-by-step quiz runner (Question-by-Question)
+//!   matching AIQuiz.tsx with instant green/red answer states, per-option explanations,
+//!   and celebratory final score card with performance grade.
 //! - ⚙ **Preferences Section:** Multiple Groq API keys with round-robin rotation,
 //!   failover, and model selection (GPT-OSS 120B, GPT-OSS 20B, Llama 3.3, Qwen 3.8).
 
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use egui::{Color32, CornerRadius, Margin, Pos2, Response, Stroke, Vec2};
+use egui::{Align, Align2, Color32, CornerRadius, Layout, Margin, Response, Stroke, Vec2, vec2};
 use pdfcraft_ai::{AiEvent, KeyPool, Message};
 use serde::{Deserialize, Serialize};
 
 use crate::theme::{self, Tokens};
-use crate::{PdfCraftApp, icons, widgets};
+use crate::{PdfCraftApp, RightPanel, icons, widgets};
+
+// ---------------------------------------------------------------------------
+// Text Sanitization & LaTeX Math Preprocessor
+// ---------------------------------------------------------------------------
+
+/// Cleans raw text extracted from PDF streams to eliminate control characters,
+/// broken ligatures, private use characters, and excessive spacing.
+pub fn clean_and_sanitize_pdf_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\n' | '\t' | '\r' => out.push(' '),
+            c if c.is_control() => continue,
+            // Reconstruct common PDF ligatures
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            // Zero-width & soft-hyphen characters
+            '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' => continue,
+            // Replacement or Private-Use characters
+            '\u{FFFD}' | '\u{E000}'..='\u{F8FF}' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    // Collapse consecutive spaces
+    let mut collapsed = String::with_capacity(out.len());
+    let mut prev_space = false;
+    for ch in out.chars() {
+        if ch == ' ' {
+            if !prev_space {
+                collapsed.push(' ');
+                prev_space = true;
+            }
+        } else {
+            collapsed.push(ch);
+            prev_space = false;
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+/// Converts LaTeX delimiters, HTML entity tags, and mathematical symbols
+/// into clean, readable Unicode math equivalents (modeled after preprocessMarkdown in books).
+pub fn preprocess_markdown_math(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut s = text.to_string();
+
+    // Strip raw HTML tags like <span> or &lt;span&gt;
+    s = s.replace("&lt;span&gt;", "")
+        .replace("&lt;/span&gt;", "")
+        .replace("<span>", "")
+        .replace("</span>", "");
+
+    // Convert display math delimiters \[ ... \] -> $$ ... $$
+    s = s.replace("\\[", "\n$$\n").replace("\\]", "\n$$\n");
+    // Convert inline math delimiters \( ... \) -> $ ... $
+    s = s.replace("\\(", "$").replace("\\)", "$");
+
+    // Mathematical symbols and Greek alphabet
+    s = s.replace("\\alpha", "α")
+        .replace("\\beta", "β")
+        .replace("\\gamma", "γ")
+        .replace("\\delta", "δ")
+        .replace("\\epsilon", "ε")
+        .replace("\\theta", "θ")
+        .replace("\\lambda", "λ")
+        .replace("\\mu", "μ")
+        .replace("\\pi", "π")
+        .replace("\\sigma", "σ")
+        .replace("\\tau", "τ")
+        .replace("\\phi", "φ")
+        .replace("\\omega", "ω")
+        .replace("\\Delta", "Δ")
+        .replace("\\Omega", "Ω")
+        .replace("\\Sigma", "Σ")
+        // Comparison & Operators
+        .replace("\\leq", "≤")
+        .replace("\\le", "≤")
+        .replace("\\geq", "≥")
+        .replace("\\ge", "≥")
+        .replace("\\neq", "≠")
+        .replace("\\ne", "≠")
+        .replace("\\approx", "≈")
+        .replace("\\pm", "±")
+        .replace("\\times", "×")
+        .replace("\\div", "÷")
+        .replace("\\cdot", "·")
+        // Arrows
+        .replace("\\rightarrow", "→")
+        .replace("\\to", "→")
+        .replace("\\leftarrow", "←")
+        .replace("\\Rightarrow", "⇒")
+        .replace("\\Leftarrow", "⇐")
+        .replace("\\Leftrightarrow", "⇔")
+        .replace("-->", "→")
+        .replace("<--", "←")
+        .replace("==>", "⇒")
+        // Calculus & Sets
+        .replace("\\infty", "∞")
+        .replace("\\sum", "∑")
+        .replace("\\prod", "∏")
+        .replace("\\int", "∫")
+        .replace("\\partial", "∂")
+        .replace("\\in", "∈")
+        .replace("\\subset", "⊂")
+        .replace("\\cap", "∩")
+        .replace("\\cup", "∪")
+        // Common Fractions & Roots (simple replacements)
+        .replace("\\sqrt", "√")
+        .replace("\\circ", "°")
+        // Superscripts
+        .replace("^2", "²")
+        .replace("^3", "³")
+        .replace("^n", "ⁿ")
+        .replace("^+", "⁺")
+        .replace("^-", "⁻");
+
+    s
+}
 
 // ---------------------------------------------------------------------------
 // Tabs & Configuration Enums
@@ -95,23 +222,27 @@ pub struct AiState {
     // Summary state
     pub summary_from_page: usize,
     pub summary_to_page: usize,
-    pub summary_style: usize, // 0 = Bullet Points, 1 = Executive, 2 = In-depth Study Notes
     pub summary_result: String,
     pub is_summarizing: bool,
     summary_receiver: Option<mpsc::Receiver<AiEvent>>,
 
-    // Quiz state
+    // Quiz generator & runner state (AIQuiz.tsx model)
     pub quiz_from_page: usize,
     pub quiz_to_page: usize,
     pub quiz_count: usize,
     pub quiz_kind: QuizKind,
     pub quiz_difficulty: QuizDifficulty,
-    pub quiz_questions: Vec<QuizQuestion>,
-    pub quiz_selected_answers: Vec<Vec<usize>>,
-    pub quiz_checked: bool,
     pub is_generating_quiz: bool,
     quiz_receiver: Option<mpsc::Receiver<AiEvent>>,
     quiz_buffer: String,
+
+    // Step-by-step Interactive Runner
+    pub quiz_questions: Vec<QuizQuestion>,
+    pub quiz_current_index: usize,
+    pub quiz_selected_options: Vec<usize>,
+    pub quiz_is_confirmed: bool,
+    pub quiz_user_answers: Vec<Vec<usize>>,
+    pub quiz_show_results: bool,
 }
 
 impl Default for AiState {
@@ -129,7 +260,6 @@ impl Default for AiState {
             error: None,
             summary_from_page: 1,
             summary_to_page: 1,
-            summary_style: 1,
             summary_result: String::new(),
             is_summarizing: false,
             summary_receiver: None,
@@ -138,12 +268,15 @@ impl Default for AiState {
             quiz_count: 5,
             quiz_kind: QuizKind::Qcs,
             quiz_difficulty: QuizDifficulty::Medium,
-            quiz_questions: Vec::new(),
-            quiz_selected_answers: Vec::new(),
-            quiz_checked: false,
             is_generating_quiz: false,
             quiz_receiver: None,
             quiz_buffer: String::new(),
+            quiz_questions: Vec::new(),
+            quiz_current_index: 0,
+            quiz_selected_options: Vec::new(),
+            quiz_is_confirmed: false,
+            quiz_user_answers: Vec::new(),
+            quiz_show_results: false,
         }
     }
 }
@@ -153,8 +286,9 @@ impl AiState {
     pub fn open_with_context(&mut self, text: String) {
         self.open = true;
         self.active_tab = AiTab::Chat;
-        if !text.trim().is_empty() {
-            self.context_text = text.trim().to_string();
+        let clean = clean_and_sanitize_pdf_text(&text);
+        if !clean.is_empty() {
+            self.context_text = clean;
         }
     }
 
@@ -276,8 +410,11 @@ impl AiState {
             Ok(questions) => {
                 let count = questions.len();
                 self.quiz_questions = questions;
-                self.quiz_selected_answers = vec![Vec::new(); count];
-                self.quiz_checked = false;
+                self.quiz_current_index = 0;
+                self.quiz_selected_options.clear();
+                self.quiz_is_confirmed = false;
+                self.quiz_show_results = false;
+                self.quiz_user_answers = vec![Vec::new(); count];
                 self.error = None;
             }
             Err(e) => {
@@ -299,224 +436,106 @@ impl AiState {
         let mut messages = vec![pdfcraft_ai::system_prompt(&self.context_text)];
         messages.extend(self.history.iter().cloned());
 
-        let (tx, rx) = mpsc::channel();
-        self.receiver = Some(rx);
-        self.streaming = None;
-
-        let pool_clone = pool.clone();
         let model = self.selected_model.clone();
-
-        std::thread::spawn(move || {
-            pdfcraft_ai::stream_chat(pool_clone, model, messages, tx);
-        });
+        let rx = pdfcraft_ai::stream_completion(pool.clone(), model, messages);
+        self.receiver = Some(rx);
+        self.streaming = Some(String::new());
     }
 
-    /// Submit the draft in the chat tab.
-    pub fn submit_draft(&mut self, pool: &KeyPool) {
-        let text = std::mem::take(&mut self.draft);
-        self.submit_prompt(pool, &text);
-    }
-
-    /// Start document summarization for the extracted text.
-    pub fn start_summary(&mut self, pool: &KeyPool, document_text: &str) {
-        if document_text.trim().is_empty() || self.is_streaming() {
+    /// Request a summary as smart comparison tables (matching books summarizeTable prompt).
+    pub fn request_summary_tables(&mut self, pool: &KeyPool, extracted_text: &str) {
+        if self.is_streaming() {
             return;
         }
         self.error = None;
         self.summary_result.clear();
         self.is_summarizing = true;
 
-        let style_desc = match self.summary_style {
-            0 => "concise bullet points highlighting key facts and outcomes",
-            2 => "in-depth analytical study notes with deep breakdowns of each topic",
-            _ => "a well-rounded executive summary with overview, key takeaways, and conclusions",
-        };
-
-        let sys_prompt = Message::system(
-            "You are an expert document summarizer and analyst embedded in PdfCraft.\
-             Summarize the provided PDF excerpt thoroughly, accurately, and clearly.\
-             Use structured markdown headers (##), bullet points, and bold text.\
-             Respond in the language of the document (Arabic, English, or French).",
+        let prompt = format!(
+            "You are an expert academic and medical summarizer. Transform the following text into structured, clean Markdown comparison tables and concise key points.\n\
+            Rules:\n\
+            1. Use Markdown tables with column headers for comparisons, classifications, mechanisms, or diagnostic criteria.\n\
+            2. For each major concept, create a dedicated table: | Criterion | Details / Characteristics | Notes |\n\
+            3. Include key bullet takeaways below the tables.\n\
+            4. Keep mathematical and scientific notation clean and precise.\n\n\
+            Text:\n\
+            {extracted_text}"
         );
 
-        let user_prompt = Message::user(format!(
-            "Please provide {style_desc} for the following text from the PDF:\n\n\"\"\"\n{}\n\"\"\"",
-            document_text.trim()
-        ));
+        let messages = vec![
+            Message::system("You are an expert summarizer that outputs well-structured Markdown tables and key takeaways."),
+            Message::user(prompt),
+        ];
 
-        let (tx, rx) = mpsc::channel();
-        self.summary_receiver = Some(rx);
-
-        let pool_clone = pool.clone();
         let model = self.selected_model.clone();
-
-        std::thread::spawn(move || {
-            pdfcraft_ai::stream_chat(pool_clone, model, vec![sys_prompt, user_prompt], tx);
-        });
+        let rx = pdfcraft_ai::stream_completion(pool.clone(), model, messages);
+        self.summary_receiver = Some(rx);
     }
 
-    /// Start generating QCMs/Quiz based on the document text.
-    pub fn start_quiz_generation(&mut self, pool: &KeyPool, document_text: &str) {
-        if document_text.trim().is_empty() || self.is_streaming() {
+    /// Request generating QCM/QCS questions from context text.
+    pub fn request_quiz(&mut self, pool: &KeyPool, context: &str) {
+        if self.is_streaming() {
             return;
         }
         self.error = None;
         self.quiz_buffer.clear();
+        self.quiz_questions.clear();
+        self.quiz_current_index = 0;
+        self.quiz_selected_options.clear();
+        self.quiz_is_confirmed = false;
+        self.quiz_show_results = false;
         self.is_generating_quiz = true;
 
-        let kind_str = match self.quiz_kind {
-            QuizKind::Qcs => "QCS (Single Correct Answer per question)",
-            QuizKind::Qcm => "QCM (Multiple Correct Answers per question)",
-        };
-
+        let count = self.quiz_count;
+        let is_qcm = self.quiz_kind == QuizKind::Qcm;
         let diff_str = match self.quiz_difficulty {
-            QuizDifficulty::Easy => "Easy (direct recall, definitions, key facts)",
-            QuizDifficulty::Medium => "Medium (comprehension, application, concept linkage)",
-            QuizDifficulty::Hard => "Hard (clinical cases, detailed discrimination between close options)",
+            QuizDifficulty::Easy => "direct recall and basic definitions",
+            QuizDifficulty::Medium => "conceptual understanding and application",
+            QuizDifficulty::Hard => "advanced analysis, clinical/critical reasoning and nuanced discrimination",
         };
 
-        let count = self.quiz_count.clamp(1, 15);
+        let type_rules = if is_qcm {
+            "QCM (Multiple Choice): Each question MUST have 2 or 3 correct answers. 'correct' field MUST be an array of numbers like [0, 2]."
+        } else {
+            "QCS (Single Choice): Each question MUST have EXACTLY 1 correct answer. 'correct' field MUST be an array with single index like [1]."
+        };
 
-        let sys_prompt = Message::system(
-            "You are an academic and clinical examination expert.\
-             Generate rigorous multiple-choice questions based STRICTLY on the provided text.\
-             Return ONLY a raw JSON array of objects without Markdown formatting or backticks.\
-             Each object MUST have:\
-             - 'question': the question text\
-             - 'options': an array of exactly 5 options (strings)\
-             - 'correct': array of integers (0-based indices of the correct options)\
-             - 'explanation': detailed rationale for why each option is correct or incorrect (e.g. 'A ✓ - ...\\nB ✗ - ...')\
-             Respond in the language of the document (Arabic, English, or French).",
+        let prompt = format!(
+            "You are an expert educational and medical exam question author. Create {count} {diff_str} questions from the text below.\n\
+            {type_rules}\n\
+            \n\
+            STRICT RULES:\n\
+            1. Output ONLY a valid JSON array of question objects. No markdown formatting, no code fences, no extra text.\n\
+            2. Each question MUST have EXACTLY 5 options (indices 0 through 4).\n\
+            3. Each option must have a detailed explanation in the 'explanation' field.\n\
+            \n\
+            Schema:\n\
+            [\n\
+              {{\n\
+                \"question\": \"Question text here?\",\n\
+                \"options\": [\"Option A\", \"Option B\", \"Option C\", \"Option D\", \"Option E\"],\n\
+                \"correct\": [0],\n\
+                \"explanation\": \"A is correct because... B is incorrect because...\"\n\
+              }}\n\
+            ]\n\n\
+            Text:\n\
+            {context}"
         );
 
-        let user_prompt = Message::user(format!(
-            "Generate {count} {kind_str} questions with difficulty '{diff_str}' from this text:\n\n\"\"\"\n{}\n\"\"\"",
-            document_text.trim()
-        ));
+        let messages = vec![
+            Message::system("You are an exam generator. Output ONLY a raw JSON array matching the requested schema."),
+            Message::user(prompt),
+        ];
 
-        let (tx, rx) = mpsc::channel();
-        self.quiz_receiver = Some(rx);
-
-        let pool_clone = pool.clone();
         let model = self.selected_model.clone();
-
-        std::thread::spawn(move || {
-            pdfcraft_ai::stream_chat(pool_clone, model, vec![sys_prompt, user_prompt], tx);
-        });
-    }
-
-    /// Clear chat history.
-    pub fn clear(&mut self) {
-        self.history.clear();
-        self.streaming = None;
-        self.receiver = None;
-        self.error = None;
-        self.draft.clear();
-    }
-
-    pub fn clear_summary(&mut self) {
-        self.summary_result.clear();
-        self.is_summarizing = false;
-        self.summary_receiver = None;
-    }
-
-    pub fn clear_quiz(&mut self) {
-        self.quiz_questions.clear();
-        self.quiz_selected_answers.clear();
-        self.quiz_checked = false;
-        self.is_generating_quiz = false;
-        self.quiz_receiver = None;
+        let rx = pdfcraft_ai::stream_completion(pool.clone(), model, messages);
+        self.quiz_receiver = Some(rx);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Text Extraction Helper from Active Document
+// Markdown & Table & Math Renderer
 // ---------------------------------------------------------------------------
-
-pub fn extract_document_text(app: &PdfCraftApp, from_page_1based: usize, to_page_1based: usize) -> String {
-    let Some(view_idx) = app.active else { return String::new() };
-    let view = &app.views[view_idx];
-    let doc_id = view.id;
-    let Some(doc) = app.session.get(doc_id) else { return String::new() };
-    let total_pages = doc.info.pages.len();
-    if total_pages == 0 {
-        return String::new();
-    }
-
-    let from = from_page_1based.clamp(1, total_pages).saturating_sub(1);
-    let to = to_page_1based.clamp(1, total_pages).max(from_page_1based).saturating_sub(1);
-
-    let mut full_text = String::new();
-    let config = pdfcraft_render::RenderConfig {
-        password: doc.password.as_deref().map(Arc::from),
-        ..Default::default()
-    };
-    let mut renderer = pdfcraft_render::PageRenderer::new(doc.bytes.clone(), config);
-
-    for p in from..=to {
-        let page_content = if let Some(t) = view.texts.get(&p) {
-            t.plain_text()
-        } else {
-            let req = pdfcraft_render::RenderRequest {
-                page: p,
-                kind: pdfcraft_render::RequestKind::Text,
-                tile: None,
-                scale: 1.0,
-                tag: 0,
-                preview: false,
-            };
-            let out = renderer.render(req);
-            out.text.map(|t| t.plain_text()).unwrap_or_default()
-        };
-
-        let trimmed = page_content.trim();
-        if !trimmed.is_empty() {
-            if !full_text.is_empty() {
-                full_text.push_str("\n\n");
-            }
-            full_text.push_str(&format!("--- Page {} ---\n", p + 1));
-            full_text.push_str(trimmed);
-        }
-
-        // Cap extraction at 35,000 characters to stay within Groq context bounds
-        if full_text.len() >= 35_000 {
-            break;
-        }
-    }
-
-    full_text
-}
-
-// ---------------------------------------------------------------------------
-// Floating AI Assistant Window
-// ---------------------------------------------------------------------------
-
-pub(crate) fn show(ui_ctx: &egui::Context, app: &mut PdfCraftApp) {
-    if !app.ai.open {
-        return;
-    }
-
-    app.ai.poll();
-    if app.ai.is_streaming() {
-        ui_ctx.request_repaint();
-    }
-
-    let t = Tokens::get(ui_ctx);
-
-    let mut is_open = app.ai.open;
-    egui::Window::new("Ask AI")
-        .id(egui::Id::new("pdfcraft-ai-floating-window"))
-        .default_pos(Pos2::new(100.0, 100.0))
-        .default_size(Vec2::new(450.0, 580.0))
-        .min_width(340.0)
-        .min_height(340.0)
-        .collapsible(false)
-        .open(&mut is_open)
-        .show(ui_ctx, |ui| {
-            render_window_body(ui, app, &t);
-        });
-    app.ai.open = is_open;
-}
 
 fn danger_color(t: &Tokens) -> Color32 {
     if t.dark() {
@@ -534,758 +553,1062 @@ fn success_color(t: &Tokens) -> Color32 {
     }
 }
 
-fn render_window_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    // Header & Tab Bar
-    ui.horizontal(|ui| {
-        ui.add(icons::image("sparkles", 16.0, t.accent));
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("PdfCraft AI").font(theme::semibold(15.0)));
+/// Renders rich formatted text: Markdown tables, math equations, code blocks,
+/// headers, bold text, and bullet lists.
+pub fn render_formatted_markdown(ui: &mut egui::Ui, text: &str, t: &Tokens) {
+    let processed = preprocess_markdown_math(text);
+    let lines: Vec<&str> = processed.lines().collect();
+    let mut i = 0;
 
-        let key_count = app.groq_keys.count();
-        let badge_text = if key_count == 0 {
-            "No keys (Add in Settings)".to_string()
-        } else {
-            format!("{key_count} key{}", if key_count > 1 { "s" } else { "" })
-        };
-        ui.label(egui::RichText::new(badge_text).small().color(if key_count == 0 { danger_color(t) } else { t.text_muted }));
+    while i < lines.len() {
+        let line = lines[i].trim();
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if icons::button(ui, "trash-2", 24.0, false, "Reset current tab").clicked() {
-                match app.ai.active_tab {
-                    AiTab::Chat => app.ai.clear(),
-                    AiTab::Summary => app.ai.clear_summary(),
-                    AiTab::Quiz => app.ai.clear_quiz(),
-                }
+        // 1. Math Display Block ($$)
+        if line == "$$" {
+            let mut math_content = String::new();
+            i += 1;
+            while i < lines.len() && lines[i].trim() != "$$" {
+                math_content.push_str(lines[i]);
+                math_content.push('\n');
+                i += 1;
             }
+            if i < lines.len() {
+                i += 1; // skip closing $$
+            }
+            egui::Frame::new()
+                .fill(t.hover)
+                .stroke(Stroke::new(1.0, t.accent))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new(math_content.trim())
+                                .font(theme::semibold(13.5))
+                                .color(t.accent),
+                        );
+                    });
+                });
+            ui.add_space(4.0);
+            continue;
+        }
+
+        // 2. Markdown Table Detection (consecutive lines with '|')
+        if line.starts_with('|') && line.ends_with('|') {
+            let mut table_lines = Vec::new();
+            while i < lines.len() && lines[i].trim().starts_with('|') && lines[i].trim().ends_with('|') {
+                table_lines.push(lines[i].trim());
+                i += 1;
+            }
+            render_markdown_table(ui, &table_lines, t);
+            ui.add_space(4.0);
+            continue;
+        }
+
+        // 3. Code Block (```)
+        if line.starts_with("```") {
+            let mut code_content = String::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim().starts_with("```") {
+                code_content.push_str(lines[i]);
+                code_content.push('\n');
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1; // skip closing ```
+            }
+            let code_to_copy = code_content.clone();
+            egui::Frame::new()
+                .fill(if t.dark() { Color32::from_rgb(18, 18, 22) } else { Color32::from_rgb(240, 240, 244) })
+                .stroke(Stroke::new(1.0, t.divider))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Code").small().color(t.text_faint));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("📋 Copy").clicked() {
+                                ui.ctx().output_mut(|o| o.copied_text = code_to_copy);
+                            }
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(code_content.trim())
+                            .font(theme::regular(12.0))
+                            .monospace()
+                            .color(t.text),
+                    );
+                });
+            ui.add_space(4.0);
+            continue;
+        }
+
+        // 4. Headings
+        if let Some(h) = line.strip_prefix("### ") {
+            ui.label(egui::RichText::new(h).font(theme::semibold(14.0)).color(t.text));
+            ui.add_space(2.0);
+            i += 1;
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("## ") {
+            ui.label(egui::RichText::new(h).font(theme::semibold(15.0)).color(t.accent));
+            ui.add_space(2.0);
+            i += 1;
+            continue;
+        }
+        if let Some(h) = line.strip_prefix("# ") {
+            ui.label(egui::RichText::new(h).font(theme::bold(16.0)).color(t.accent));
+            ui.add_space(4.0);
+            i += 1;
+            continue;
+        }
+
+        // 5. Bullet Lists
+        if let Some(item) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")).or_else(|| line.strip_prefix("• ")) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("•").color(t.accent).font(theme::bold(13.0)));
+                render_inline_spans(ui, item, t);
+            });
+            ui.add_space(1.0);
+            i += 1;
+            continue;
+        }
+
+        // 6. Numbered Lists
+        if line.len() > 2 && line.chars().next().is_some_and(|c| c.is_ascii_digit()) && line.contains(". ") {
+            if let Some(dot_idx) = line.find(". ") {
+                let num_str = &line[..=dot_idx];
+                let rest = &line[dot_idx + 2..];
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(num_str).color(t.accent).font(theme::semibold(12.5)));
+                    render_inline_spans(ui, rest, t);
+                });
+                ui.add_space(1.0);
+                i += 1;
+                continue;
+            }
+        }
+
+        // 7. Regular paragraph
+        if !line.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                render_inline_spans(ui, line, t);
+            });
+            ui.add_space(2.0);
+        } else {
+            ui.add_space(4.0);
+        }
+
+        i += 1;
+    }
+}
+
+/// Renders a detected Markdown table as a visually clean, structured table.
+fn render_markdown_table(ui: &mut egui::Ui, lines: &[&str], t: &Tokens) {
+    if lines.is_empty() {
+        return;
+    }
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for l in lines {
+        // Strip leading & trailing '|'
+        let trimmed = l.trim().trim_start_matches('|').trim_end_matches('|');
+        // Check if this is a separator line (|---|---|)
+        if trimmed.chars().all(|c| c == '-' || c == '|' || c == ':' || c == ' ') {
+            continue;
+        }
+        let cells: Vec<String> = trimmed.split('|').map(|c| c.trim().to_string()).collect();
+        if !cells.is_empty() {
+            rows.push(cells);
+        }
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let table_raw = lines.join("\n");
+    egui::Frame::new()
+        .fill(t.hover)
+        .stroke(Stroke::new(1.0, t.divider))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            // Header bar of the table with copy button
+            ui.horizontal(|ui| {
+                ui.add(icons::image("table", 13.0, t.accent));
+                ui.label(egui::RichText::new("Table").small().font(theme::semibold(11.0)).color(t.accent));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("📋 Copy Table").clicked() {
+                        ui.ctx().output_mut(|o| o.copied_text = table_raw);
+                    }
+                });
+            });
+            ui.add_space(2.0);
+
+            // Table Grid
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+                egui::Grid::new(ui.id().with("ai_md_table"))
+                    .striped(true)
+                    .spacing(vec2(10.0, 6.0))
+                    .min_col_width(70.0)
+                    .show(ui, |ui| {
+                        for (row_idx, row) in rows.iter().enumerate() {
+                            let is_header = row_idx == 0;
+                            for col_idx in 0..col_count {
+                                let cell_text = row.get(col_idx).map(|s| s.as_str()).unwrap_or("");
+                                if is_header {
+                                    ui.label(
+                                        egui::RichText::new(cell_text)
+                                            .font(theme::semibold(12.5))
+                                            .color(t.accent),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(cell_text)
+                                            .font(theme::regular(12.0))
+                                            .color(t.text),
+                                    );
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
         });
-    });
+}
 
-    ui.add_space(4.0);
+/// Helper to render inline formatting like **bold** text and `inline code`.
+fn render_inline_spans(ui: &mut egui::Ui, text: &str, t: &Tokens) {
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(start) = rest.find("**") {
+            if start > 0 {
+                ui.label(egui::RichText::new(&rest[..start]).color(t.text));
+            }
+            let after_start = &rest[start + 2..];
+            if let Some(end) = after_start.find("**") {
+                let bold_text = &after_start[..end];
+                ui.label(egui::RichText::new(bold_text).font(theme::semibold(12.5)).color(t.text));
+                rest = &after_start[end + 2..];
+            } else {
+                ui.label(egui::RichText::new(&rest[start..]).color(t.text));
+                break;
+            }
+        } else if let Some(code_start) = rest.find('`') {
+            if code_start > 0 {
+                ui.label(egui::RichText::new(&rest[..code_start]).color(t.text));
+            }
+            let after_code = &rest[code_start + 1..];
+            if let Some(code_end) = after_code.find('`') {
+                let code_str = &after_code[..code_end];
+                egui::Frame::new()
+                    .fill(t.hover)
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(Margin::symmetric(4, 1))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(code_str).monospace().small().color(t.accent));
+                    });
+                rest = &after_code[code_end + 1..];
+            } else {
+                ui.label(egui::RichText::new(&rest[code_start..]).color(t.text));
+                break;
+            }
+        } else {
+            ui.label(egui::RichText::new(rest).color(t.text));
+            break;
+        }
+    }
+}
 
-    // Navigation Tabs
+// ---------------------------------------------------------------------------
+// Document Text Extraction Helper
+// ---------------------------------------------------------------------------
+
+pub fn extract_document_text(app: &mut PdfCraftApp, start_page: usize, end_page: usize) -> Result<String, String> {
+    let Some((index, _)) = app.active_ids() else {
+        return Err("No active PDF document open".to_string());
+    };
+    let view = &mut app.views[index];
+    let total_pages = view.page_count;
+
+    if total_pages == 0 {
+        return Err("Document is empty".to_string());
+    }
+
+    let s = start_page.max(1).min(total_pages);
+    let e = end_page.max(s).min(total_pages);
+
+    let mut combined = String::new();
+    let mut renderer = pdfcraft_render::PageRenderer::new();
+
+    for p in s..=e {
+        let page_index = p - 1;
+        if let Some(text_layer) = view.texts.get(&page_index) {
+            combined.push_str(&text_layer.plain_text());
+            combined.push('\n');
+        } else {
+            let req = pdfcraft_render::RenderRequest {
+                doc: view.id,
+                page: page_index,
+                kind: pdfcraft_render::RequestKind::Text,
+                size: [100, 100],
+            };
+            if let Ok(pdfcraft_render::RenderOutput::Text(t)) = renderer.render(req, &app.session) {
+                combined.push_str(&t.plain_text());
+                combined.push('\n');
+            }
+        }
+    }
+
+    let clean = clean_and_sanitize_pdf_text(&combined);
+    if clean.is_empty() {
+        return Err("No readable text found on the selected pages".to_string());
+    }
+
+    // Cap context length at 35,000 characters to match books and avoid token overflow
+    if clean.chars().count() > 35_000 {
+        let truncated: String = clean.chars().take(35_000).collect();
+        Ok(format!("{truncated}\n...[Document excerpt truncated for model context limit]"))
+    } else {
+        Ok(clean)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Right Side Panel UI (The core user experience matching books AIPanel)
+// ---------------------------------------------------------------------------
+
+/// Main entry point called by `panels::right_panel` when `RightPanel::Ai` is open.
+pub fn render_right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
+
+    // 1. Navigation Tabs Header (Chat, Summary, Quiz)
     ui.horizontal(|ui| {
-        for (tab, label) in [
-            (AiTab::Chat, "💬 Chat"),
-            (AiTab::Summary, "📄 Summary"),
-            (AiTab::Quiz, "🎯 QCM / Quiz"),
-        ] {
-            let is_sel = app.ai.active_tab == tab;
-            if widgets::mode_tab(ui, label, is_sel).clicked() {
+        let tabs = [
+            (AiTab::Chat, "message-square-text", "Chat (محادثة)"),
+            (AiTab::Summary, "file-text", "Summary (ملخص)"),
+            (AiTab::Quiz, "help-circle", "Quiz (اختبار)"),
+        ];
+
+        for (tab, icon, label) in tabs {
+            let selected = app.ai.active_tab == tab;
+            let (bg, stroke, text_color) = if selected {
+                (t.accent_soft, Stroke::new(1.0, t.accent), t.accent)
+            } else {
+                (Color32::TRANSPARENT, Stroke::new(1.0, t.divider), t.text_muted)
+            };
+
+            let resp = egui::Frame::new()
+                .fill(bg)
+                .stroke(stroke)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(icons::image(icon, 14.0, text_color));
+                        ui.label(egui::RichText::new(label).font(theme::semibold(12.0)).color(text_color));
+                    });
+                })
+                .response;
+
+            if resp.interact(egui::Sense::click()).clicked() {
                 app.ai.active_tab = tab;
             }
         }
     });
 
+    ui.add_space(4.0);
     ui.separator();
+    ui.add_space(2.0);
 
-    // Body based on active tab
+    // Error banner if any
+    if let Some(err) = &app.ai.error {
+        egui::Frame::new()
+            .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 25))
+            .stroke(Stroke::new(1.0, danger_color(&t)))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::same(8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(icons::image("alert-circle", 14.0, danger_color(&t)));
+                    ui.label(egui::RichText::new(err).small().color(danger_color(&t)));
+                });
+            });
+        ui.add_space(4.0);
+    }
+
+    // 2. Dispatch Active Tab
     match app.ai.active_tab {
-        AiTab::Chat => render_chat_tab(ui, app, t),
-        AiTab::Summary => render_summary_tab(ui, app, t),
-        AiTab::Quiz => render_quiz_tab(ui, app, t),
+        AiTab::Chat => render_chat_tab(ui, app, &t),
+        AiTab::Summary => render_summary_tab(ui, app, &t),
+        AiTab::Quiz => render_quiz_tab(ui, app, &t),
     }
 }
 
 // ---------------------------------------------------------------------------
-// TAB 1: Chat
+// 1. Chat Tab
 // ---------------------------------------------------------------------------
 
 fn render_chat_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    // Context preview card (if text is selected)
+    // Context Excerpt Card
     if !app.ai.context_text.is_empty() {
         egui::Frame::new()
             .fill(t.hover)
-            .corner_radius(CornerRadius::same(6))
+            .stroke(Stroke::new(1.0, t.divider))
+            .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.add(icons::image("file-text", 12.0, t.accent));
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new("PDF Context Excerpt").small().font(theme::semibold(11.0)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("Selected PDF Excerpt").font(theme::semibold(11.0)).color(t.accent));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("✕").clicked() {
                             app.ai.context_text.clear();
                         }
                     });
                 });
-                let excerpt = if app.ai.context_text.chars().count() > 180 {
-                    let mut s: String = app.ai.context_text.chars().take(180).collect();
-                    s.push('…');
+                let excerpt = if app.ai.context_text.chars().count() > 160 {
+                    let mut s: String = app.ai.context_text.chars().take(160).collect();
+                    s.push_str("…");
                     s
                 } else {
                     app.ai.context_text.clone()
                 };
                 ui.label(egui::RichText::new(excerpt).small().color(t.text_muted).italics());
             });
-        ui.add_space(4.0);
+        ui.add_space(2.0);
     }
 
-    // Quick action pills
+    // Quick Action Chips (Explain, Summarize as Table, Key Takeaways)
     if !app.ai.context_text.is_empty() && !app.ai.is_streaming() {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let pool = app.groq_keys.clone();
             if ui.small_button("💡 Explain this").clicked() {
                 app.ai.submit_prompt(&pool, "Explain this selected excerpt clearly and simply.");
             }
-            if ui.small_button("📝 Summarize").clicked() {
-                app.ai.submit_prompt(&pool, "Summarize the key points of this excerpt.");
+            if ui.small_button("📊 Summarize as Table").clicked() {
+                app.ai.submit_prompt(&pool, "Summarize this excerpt as a clean Markdown comparison table.");
             }
-            if ui.small_button("🔍 Key takeaways").clicked() {
-                app.ai.submit_prompt(&pool, "Extract the main insights and takeaways from this excerpt.");
+            if ui.small_button("🔍 Key Takeaways").clicked() {
+                app.ai.submit_prompt(&pool, "Extract the core key takeaways from this excerpt.");
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(2.0);
     }
 
-    // Chat history area
-    let bottom_height = 80.0;
-    let scroll_height = (ui.available_height() - bottom_height).max(100.0);
+    // Scrollable Chat History
+    let input_area_height = 80.0;
+    let scroll_h = (ui.available_height() - input_area_height).max(100.0);
+
     egui::ScrollArea::vertical()
-        .max_height(scroll_height)
+        .max_height(scroll_h)
         .stick_to_bottom(true)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
             if app.ai.history.is_empty() && app.ai.streaming.is_none() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.add(icons::image("sparkles", 28.0, t.text_muted));
+                    ui.add_space(30.0);
+                    ui.add(icons::image("sparkles", 32.0, t.text_faint));
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Select any text in the PDF and click 'Ask AI'").color(t.text_muted).italics());
-                    ui.label(egui::RichText::new("or type a question below to analyze your document.").small().color(t.text_muted));
+                    ui.label(egui::RichText::new("Ask any question about your PDF").font(theme::semibold(13.0)).color(t.text_muted));
+                    ui.label(egui::RichText::new("Select text in the document or type below").small().color(t.text_faint));
                 });
             }
 
             for msg in &app.ai.history {
-                render_bubble(ui, msg, t);
+                render_chat_bubble(ui, msg, t);
             }
 
-            // Real-time streaming bubble
-            if let Some(partial) = &app.ai.streaming {
-                let streaming_msg = Message::assistant(partial.clone());
-                render_bubble(ui, &streaming_msg, t);
-                let cursor = if (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0 { "▋" } else { " " };
-                ui.label(egui::RichText::new(cursor).color(t.accent));
+            if let Some(stream_text) = &app.ai.streaming {
+                let stream_msg = Message::assistant(stream_text.clone());
+                render_chat_bubble(ui, &stream_msg, t);
             }
         });
 
-    // Error banner
-    if let Some(err) = &app.ai.error.clone() {
-        render_error_banner(ui, err);
-    }
-
     ui.separator();
 
-    // Input row
+    // Input Bar (Fixed at bottom)
     ui.horizontal(|ui| {
-        let input_id = egui::Id::new("ai-draft-input-field");
-        let available_w = ui.available_width() - 40.0;
-        let resp = ui.add_sized(
-            Vec2::new(available_w, 30.0),
-            egui::TextEdit::singleline(&mut app.ai.draft)
-                .id(input_id)
-                .hint_text("Ask a question about the PDF…")
-                .desired_width(available_w),
-        );
+        let is_loading = app.ai.is_streaming();
+        let edit = egui::TextEdit::multiline(&mut app.ai.draft)
+            .hint_text("Ask AI a question… (Enter to send)")
+            .desired_rows(2)
+            .desired_width(ui.available_width() - 40.0);
 
-        let is_streaming = app.ai.is_streaming();
-        let should_send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let resp = ui.add_enabled(!is_loading, edit);
 
-        if should_send && !is_streaming {
+        // Submit on Enter without Shift
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
             let pool = app.groq_keys.clone();
-            app.ai.submit_draft(&pool);
-            ui.memory_mut(|m| m.request_focus(input_id));
+            let draft = std::mem::take(&mut app.ai.draft);
+            app.ai.submit_prompt(&pool, &draft);
         }
 
-        let send_btn = icons::button(ui, if is_streaming { "clock" } else { "send" }, 30.0, false, "Send");
-        if send_btn.clicked() && !is_streaming {
+        let send_btn = egui::Button::new(egui::RichText::new("➤").font(theme::bold(14.0)))
+            .min_size(vec2(32.0, 32.0));
+
+        if ui.add_enabled(!is_loading && !app.ai.draft.trim().is_empty(), send_btn).clicked() {
             let pool = app.groq_keys.clone();
-            app.ai.submit_draft(&pool);
-            ui.memory_mut(|m| m.request_focus(input_id));
+            let draft = std::mem::take(&mut app.ai.draft);
+            app.ai.submit_prompt(&pool, &draft);
         }
     });
+}
 
-    ui.add_space(2.0);
-    render_footer(ui, app, t);
+fn render_chat_bubble(ui: &mut egui::Ui, msg: &Message, t: &Tokens) {
+    let is_user = msg.role == "user";
+    ui.add_space(3.0);
+
+    if is_user {
+        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+            egui::Frame::new()
+                .fill(t.accent)
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(&msg.content).font(theme::regular(12.5)).color(Color32::WHITE));
+                });
+        });
+    } else {
+        let copy_content = msg.content.clone();
+        egui::Frame::new()
+            .fill(t.hover)
+            .stroke(Stroke::new(1.0, t.divider))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add(icons::image("sparkles", 13.0, t.accent));
+                    ui.label(egui::RichText::new("Assistant").small().font(theme::semibold(11.0)).color(t.accent));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("📋").on_hover_text("Copy message").clicked() {
+                            ui.ctx().output_mut(|o| o.copied_text = copy_content);
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                render_formatted_markdown(ui, &msg.content, t);
+            });
+    }
 }
 
 // ---------------------------------------------------------------------------
-// TAB 2: Document Summary
+// 2. Summary Tab (Tables & Executive Summary)
 // ---------------------------------------------------------------------------
 
 fn render_summary_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    let total_pages = app
-        .active
-        .and_then(|i| app.session.get(app.views[i].id))
-        .map_or(1, |d| d.info.pages.len());
-    let current_page = app.active.map_or(1, |i| app.views[i].current + 1);
+    let active_pages = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.page_count);
 
-    // Page Range & Settings Header
+    // Page Range & Trigger Controls
     egui::Frame::new()
         .fill(t.hover)
-        .corner_radius(CornerRadius::same(6))
+        .stroke(Stroke::new(1.0, t.divider))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Pages:").font(theme::semibold(12.0)));
-                ui.add(egui::DragValue::new(&mut app.ai.summary_from_page).range(1..=total_pages).prefix("p. "));
-                ui.label("to");
-                ui.add(egui::DragValue::new(&mut app.ai.summary_to_page).range(1..=total_pages).prefix("p. "));
 
-                if ui.small_button("Current").clicked() {
-                    app.ai.summary_from_page = current_page;
-                    app.ai.summary_to_page = current_page;
-                }
-                if ui.small_button("All Pages").clicked() {
-                    app.ai.summary_from_page = 1;
-                    app.ai.summary_to_page = total_pages;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Page Range:").font(theme::semibold(12.0)));
+                ui.add(egui::DragValue::new(&mut app.ai.summary_from_page).range(1..=active_pages).prefix("From p. "));
+                ui.add(egui::DragValue::new(&mut app.ai.summary_to_page).range(1..=active_pages).prefix("To p. "));
+
+                if ui.small_button("Current Page").clicked() {
+                    let cur = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.current + 1);
+                    app.ai.summary_from_page = cur;
+                    app.ai.summary_to_page = cur;
                 }
             });
 
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Style:").font(theme::semibold(12.0)));
-                for (style_idx, label) in [(0, "Bullets"), (1, "Executive"), (2, "Study Notes")] {
-                    if ui.selectable_label(app.ai.summary_style == style_idx, label).clicked() {
-                        app.ai.summary_style = style_idx;
+
+            let is_loading = app.ai.is_summarizing;
+            let btn_text = if is_loading { "⏳ Generating Tables..." } else { "📊 Generate Comparison Tables" };
+            let btn = egui::Button::new(egui::RichText::new(btn_text).font(theme::semibold(13.0)).color(Color32::WHITE))
+                .fill(t.accent)
+                .min_size(vec2(ui.available_width(), 32.0));
+
+            if ui.add_enabled(!is_loading, btn).clicked() {
+                let s = app.ai.summary_from_page;
+                let e = app.ai.summary_to_page;
+                match extract_document_text(app, s, e) {
+                    Ok(text) => {
+                        let pool = app.groq_keys.clone();
+                        app.ai.request_summary_tables(&pool, &text);
+                    }
+                    Err(err) => {
+                        app.ai.error = Some(err);
                     }
                 }
-            });
-
-            ui.add_space(6.0);
-            let is_running = app.ai.is_summarizing;
-            let btn_label = if is_running { "⏳ Generating Summary…" } else { "⚡ Generate Summary" };
-
-            ui.horizontal(|ui| {
-                let pool = app.groq_keys.clone();
-                let from = app.ai.summary_from_page;
-                let to = app.ai.summary_to_page;
-
-                if ui.add_enabled(!is_running, egui::Button::new(btn_label)).clicked() {
-                    let doc_text = extract_document_text(app, from, to);
-                    app.ai.start_summary(&pool, &doc_text);
-                }
-
-                if !app.ai.summary_result.is_empty() {
-                    if ui.button("📋 Copy").clicked() {
-                        ui.ctx().copy_text(app.ai.summary_result.clone());
-                    }
-                    if ui.button("🗑 Clear").clicked() {
-                        app.ai.summary_result.clear();
-                    }
-                }
-            });
-        });
-
-    ui.add_space(6.0);
-
-    // Summary Text Output Area
-    let bottom_h = 30.0;
-    let scroll_h = (ui.available_height() - bottom_h).max(120.0);
-    egui::ScrollArea::vertical()
-        .max_height(scroll_h)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-
-            if app.ai.summary_result.is_empty() && !app.ai.is_summarizing {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.add(icons::image("file-text", 28.0, t.text_muted));
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Choose a page range above and click 'Generate Summary'").color(t.text_muted).italics());
-                });
-            } else {
-                egui::Frame::new()
-                    .fill(t.hover)
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(egui::RichText::new(&app.ai.summary_result).color(t.text));
-                        if app.ai.is_summarizing {
-                            let cursor = if (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0 { "▋" } else { " " };
-                            ui.label(egui::RichText::new(cursor).color(t.accent));
-                        }
-                    });
             }
         });
 
-    if let Some(err) = &app.ai.error.clone() {
-        render_error_banner(ui, err);
-    }
+    ui.add_space(4.0);
 
-    render_footer(ui, app, t);
+    // Summary Result Output with Copy & Clear actions
+    if !app.ai.summary_result.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Summary & Tables").font(theme::semibold(12.5)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("🗑 Clear").clicked() {
+                    app.ai.summary_result.clear();
+                }
+                if ui.small_button("📋 Copy All").clicked() {
+                    ui.ctx().output_mut(|o| o.copied_text = app.ai.summary_result.clone());
+                }
+            });
+        });
+        ui.add_space(2.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::Frame::new()
+                .fill(t.hover)
+                .stroke(Stroke::new(1.0, t.divider))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(10))
+                .show(ui, |ui| {
+                    render_formatted_markdown(ui, &app.ai.summary_result, t);
+                });
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
-// TAB 3: Interactive QCMs / Quiz
+// 3. Quiz Tab (AIQuiz.tsx model: Interactive Question-by-Question runner)
 // ---------------------------------------------------------------------------
 
 fn render_quiz_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    let total_pages = app
-        .active
-        .and_then(|i| app.session.get(app.views[i].id))
-        .map_or(1, |d| d.info.pages.len());
-    let current_page = app.active.map_or(1, |i| app.views[i].current + 1);
-
-    // If no questions generated yet, show setup screen
-    if app.ai.quiz_questions.is_empty() {
-        egui::Frame::new()
-            .fill(t.hover)
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Configure QCM / Quiz Generator").font(theme::semibold(13.0)));
-                ui.add_space(6.0);
-
-                // Scope
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Pages:").font(theme::semibold(12.0)));
-                    ui.add(egui::DragValue::new(&mut app.ai.quiz_from_page).range(1..=total_pages).prefix("p. "));
-                    ui.label("to");
-                    ui.add(egui::DragValue::new(&mut app.ai.quiz_to_page).range(1..=total_pages).prefix("p. "));
-                    if ui.small_button("Current").clicked() {
-                        app.ai.quiz_from_page = current_page;
-                        app.ai.quiz_to_page = current_page;
-                    }
-                    if ui.small_button("All").clicked() {
-                        app.ai.quiz_from_page = 1;
-                        app.ai.quiz_to_page = total_pages;
-                    }
-                });
-
-                ui.add_space(6.0);
-
-                // Type: QCS vs QCM
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Type:").font(theme::semibold(12.0)));
-                    if ui.selectable_label(app.ai.quiz_kind == QuizKind::Qcs, "QCS (Single Choice)").clicked() {
-                        app.ai.quiz_kind = QuizKind::Qcs;
-                    }
-                    if ui.selectable_label(app.ai.quiz_kind == QuizKind::Qcm, "QCM (Multiple Choices)").clicked() {
-                        app.ai.quiz_kind = QuizKind::Qcm;
-                    }
-                });
-
-                ui.add_space(6.0);
-
-                // Difficulty
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Difficulty:").font(theme::semibold(12.0)));
-                    for (diff, label) in [
-                        (QuizDifficulty::Easy, "Easy (سهل)"),
-                        (QuizDifficulty::Medium, "Medium (متوسط)"),
-                        (QuizDifficulty::Hard, "Hard (صعب)"),
-                    ] {
-                        if ui.selectable_label(app.ai.quiz_difficulty == diff, label).clicked() {
-                            app.ai.quiz_difficulty = diff;
-                        }
-                    }
-                });
-
-                ui.add_space(6.0);
-
-                // Question count
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Questions:").font(theme::semibold(12.0)));
-                    for count in [3, 5, 10] {
-                        if ui.selectable_label(app.ai.quiz_count == count, format!("{count}")).clicked() {
-                            app.ai.quiz_count = count;
-                        }
-                    }
-                });
-
-                ui.add_space(10.0);
-
-                let is_running = app.ai.is_generating_quiz;
-                let btn_text = if is_running { "⏳ Generating Questions with Groq…" } else { "🎯 Generate QCM / Quiz" };
-
-                let pool = app.groq_keys.clone();
-                let from = app.ai.quiz_from_page;
-                let to = app.ai.quiz_to_page;
-
-                if ui.add_enabled(!is_running, egui::Button::new(btn_text)).clicked() {
-                    let doc_text = extract_document_text(app, from, to);
-                    app.ai.start_quiz_generation(&pool, &doc_text);
-                }
-            });
-
-        if let Some(err) = &app.ai.error.clone() {
-            render_error_banner(ui, err);
-        }
-
-        render_footer(ui, app, t);
+    // State 1: Generating Questions Loading
+    if app.ai.is_generating_quiz {
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.add(icons::image("sparkles", 32.0, t.accent));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Generating Interactive Quiz...").font(theme::semibold(14.0)).color(t.accent));
+            ui.label(egui::RichText::new("Analyzing document concepts & extracting clinical/academic questions").small().color(t.text_muted));
+        });
         return;
     }
 
-    // Interactive Quiz Session View
-    let question_count = app.ai.quiz_questions.len();
-
-    // Score header if checked
-    if app.ai.quiz_checked {
-        let mut score = 0;
-        for (q_idx, q) in app.ai.quiz_questions.iter().enumerate() {
-            let user_sel = app.ai.quiz_selected_answers.get(q_idx).cloned().unwrap_or_default();
-            let mut correct_sorted = q.correct.clone();
-            let mut user_sorted = user_sel.clone();
-            correct_sorted.sort_unstable();
-            user_sorted.sort_unstable();
-            if correct_sorted == user_sorted {
-                score += 1;
-            }
-        }
-
-        let percentage = (score as f32 / question_count.max(1) as f32) * 100.0;
-        let score_color = if percentage >= 80.0 {
-            success_color(t)
-        } else if percentage >= 50.0 {
-            t.accent
-        } else {
-            danger_color(t)
-        };
-
-        egui::Frame::new()
-            .fill(t.hover)
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("🎯 Score: {score} / {question_count} ({percentage:.0}%)"))
-                            .font(theme::semibold(14.0))
-                            .color(score_color),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("✨ New Quiz").clicked() {
-                            app.ai.clear_quiz();
-                        }
-                        if ui.small_button("🔄 Retake").clicked() {
-                            for answers in &mut app.ai.quiz_selected_answers {
-                                answers.clear();
-                            }
-                            app.ai.quiz_checked = false;
-                        }
-                    });
-                });
-            });
-
-        ui.add_space(6.0);
+    // State 2: No Quiz Generated Yet -> Settings Card
+    if app.ai.quiz_questions.is_empty() {
+        render_quiz_setup(ui, app, t);
+        return;
     }
 
-    // Scrollable questions list
-    let bottom_h = 45.0;
-    let scroll_h = (ui.available_height() - bottom_h).max(120.0);
-    egui::ScrollArea::vertical()
-        .max_height(scroll_h)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+    // State 3: Quiz Finished -> Show Final Score Card
+    if app.ai.quiz_show_results {
+        render_quiz_score_card(ui, app, t);
+        return;
+    }
 
-            for q_idx in 0..question_count {
-                let q = match app.ai.quiz_questions.get(q_idx) {
-                    Some(q) => q.clone(),
-                    None => continue,
-                };
-
-                egui::Frame::new()
-                    .fill(t.hover)
-                    .corner_radius(CornerRadius::same(8))
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-
-                        ui.label(
-                            egui::RichText::new(format!("Q{}: {}", q_idx + 1, q.question))
-                                .font(theme::semibold(13.0))
-                                .color(t.text),
-                        );
-                        ui.add_space(4.0);
-
-                        for (opt_idx, opt_text) in q.options.iter().enumerate() {
-                            let is_selected = app.ai.quiz_selected_answers
-                                .get(q_idx)
-                                .map_or(false, |ans| ans.contains(&opt_idx));
-
-                            let is_correct_ans = q.correct.contains(&opt_idx);
-
-                            let (bg_color, border_stroke) = if app.ai.quiz_checked {
-                                if is_correct_ans {
-                                    (Color32::from_rgba_unmultiplied(16, 185, 129, 45), Stroke::new(1.0, Color32::from_rgb(16, 185, 129)))
-                                } else if is_selected {
-                                    (Color32::from_rgba_unmultiplied(239, 68, 68, 45), Stroke::new(1.0, Color32::from_rgb(239, 68, 68)))
-                                } else {
-                                    (Color32::TRANSPARENT, Stroke::NONE)
-                                }
-                            } else if is_selected {
-                                (t.accent_soft, Stroke::new(1.0, t.accent))
-                            } else {
-                                (Color32::TRANSPARENT, Stroke::NONE)
-                            };
-
-                            let prefix = match opt_idx {
-                                0 => "A",
-                                1 => "B",
-                                2 => "C",
-                                3 => "D",
-                                _ => "E",
-                            };
-
-                            let mark = if app.ai.quiz_checked {
-                                if is_correct_ans {
-                                    " ✓"
-                                } else if is_selected {
-                                    " ✗"
-                                } else {
-                                    ""
-                                }
-                            } else {
-                                ""
-                            };
-
-                            egui::Frame::new()
-                                .fill(bg_color)
-                                .stroke(border_stroke)
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    let btn = ui.selectable_label(is_selected, format!("{prefix}. {opt_text}{mark}"));
-                                    if !app.ai.quiz_checked && btn.clicked() {
-                                        if let Some(ans) = app.ai.quiz_selected_answers.get_mut(q_idx) {
-                                            if app.ai.quiz_kind == QuizKind::Qcs {
-                                                ans.clear();
-                                                ans.push(opt_idx);
-                                            } else if let Some(pos) = ans.iter().position(|&x| x == opt_idx) {
-                                                ans.remove(pos);
-                                            } else {
-                                                ans.push(opt_idx);
-                                            }
-                                        }
-                                    }
-                                });
-                            ui.add_space(2.0);
-                        }
-
-                        // Detailed explanation when checked
-                        if app.ai.quiz_checked && !q.explanation.is_empty() {
-                            ui.add_space(4.0);
-                            egui::Frame::new()
-                                .fill(Color32::from_rgba_unmultiplied(100, 100, 100, 20))
-                                .corner_radius(CornerRadius::same(6))
-                                .inner_margin(Margin::same(8))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(egui::RichText::new("💡 Explanation:").small().font(theme::semibold(11.0)));
-                                    ui.label(egui::RichText::new(&q.explanation).small().color(t.text_muted));
-                                });
-                        }
-                    });
-                ui.add_space(8.0);
-            }
-        });
-
-    ui.separator();
-
-    // Bottom action bar
-    ui.horizontal(|ui| {
-        if !app.ai.quiz_checked {
-            if ui.button("✅ Check Answers / تصحيح").clicked() {
-                app.ai.quiz_checked = true;
-            }
-        } else {
-            if ui.button("🔄 Retake Quiz").clicked() {
-                for answers in &mut app.ai.quiz_selected_answers {
-                    answers.clear();
-                }
-                app.ai.quiz_checked = false;
-            }
-            if ui.button("✨ Generate New Quiz").clicked() {
-                app.ai.clear_quiz();
-            }
-        }
-    });
+    // State 4: Interactive Question Runner (Question by Question)
+    render_quiz_runner(ui, app, t);
 }
 
-// ---------------------------------------------------------------------------
-// Shared UI Elements
-// ---------------------------------------------------------------------------
-
-fn render_bubble(ui: &mut egui::Ui, msg: &Message, t: &Tokens) {
-    let is_user = msg.role == "user";
-    let (fill, text_color, layout) = if is_user {
-        (t.accent_soft, t.accent_text, egui::Layout::right_to_left(egui::Align::TOP))
-    } else {
-        (t.hover, t.text, egui::Layout::left_to_right(egui::Align::TOP))
-    };
-
-    ui.with_layout(layout, |ui| {
-        egui::Frame::new()
-            .fill(fill)
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_max_width(ui.available_width() * 0.88);
-                ui.label(egui::RichText::new(&msg.content).color(text_color));
-            });
-    });
-    ui.add_space(4.0);
-}
-
-fn render_error_banner(ui: &mut egui::Ui, err: &str) {
-    egui::Frame::new()
-        .fill(Color32::from_rgb(0x7a, 0x1f, 0x1f))
-        .corner_radius(CornerRadius::same(6))
-        .inner_margin(Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new(err).small().color(Color32::from_rgb(0xff, 0xdd, 0xdd)));
-        });
-    ui.add_space(4.0);
-}
-
-fn render_footer(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!("Model: {}", app.ai.selected_model))
-                .small()
-                .color(t.text_muted),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("⚙ Settings").clicked() {
-                app.dialog = Some(crate::Dialog::Preferences);
-            }
-        });
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Preferences Section for AI & Groq Keys
-// ---------------------------------------------------------------------------
-
-pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    ui.label(egui::RichText::new("AI Assistant (Groq & GPT-OSS)").font(theme::semibold(13.0)));
+fn render_quiz_setup(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
+    let active_pages = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.page_count);
 
     egui::Frame::new()
         .fill(t.hover)
-        .corner_radius(CornerRadius::same(6))
+        .stroke(Stroke::new(1.0, t.divider))
+        .corner_radius(CornerRadius::same(8))
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
-            // Model selector
-            ui.horizontal(|ui| {
-                ui.label("Active Model:");
-                let current_label = pdfcraft_ai::AVAILABLE_MODELS
-                    .iter()
-                    .find(|(id, _)| *id == app.ai.selected_model.as_str())
-                    .map(|(_, l)| *l)
-                    .unwrap_or("GPT-OSS 120B");
-
-                egui::ComboBox::from_id_salt("ai-model-selector")
-                    .selected_text(current_label)
-                    .width(300.0)
-                    .show_ui(ui, |ui| {
-                        for &(id, label) in pdfcraft_ai::AVAILABLE_MODELS {
-                            if ui.selectable_label(app.ai.selected_model == id, label).clicked() {
-                                app.ai.selected_model = id.to_string();
-                                ui.close();
-                            }
-                        }
-                    });
-            });
-
+            ui.label(egui::RichText::new("Generate Interactive Quiz (اختبار تفاعلي)").font(theme::semibold(13.5)).color(t.accent));
+            ui.label(egui::RichText::new("Test your knowledge and retention from this PDF").small().color(t.text_muted));
             ui.add_space(6.0);
 
-            // API keys summary
-            let key_count = app.groq_keys.count();
+            // Question Type (QCS vs QCM)
             ui.horizontal(|ui| {
-                ui.add(icons::image("shield-check", 14.0, t.accent));
-                ui.add_space(4.0);
-                if key_count == 0 {
-                    ui.label(egui::RichText::new("No Groq API keys configured").color(danger_color(t)));
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{key_count} active API key{} · Round-robin rotation active",
-                            if key_count > 1 { "s" } else { "" }
-                        ))
-                        .color(t.accent_text),
-                    );
+                ui.label("Type:");
+                if ui.selectable_label(app.ai.quiz_kind == QuizKind::Qcs, "QCS (Single Choice)").clicked() {
+                    app.ai.quiz_kind = QuizKind::Qcs;
+                }
+                if ui.selectable_label(app.ai.quiz_kind == QuizKind::Qcm, "QCM (Multiple Choices)").clicked() {
+                    app.ai.quiz_kind = QuizKind::Qcm;
                 }
             });
+            ui.add_space(4.0);
 
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Add Groq API Keys (paste one key per line, or comma-separated):").small());
-
-            let text_edit = egui::TextEdit::multiline(&mut app.ai.keys_input)
-                .hint_text("gsk_...\ngsk_...\ngsk_...")
-                .desired_rows(3)
-                .desired_width(ui.available_width());
-            ui.add(text_edit);
-
+            // Question Count
             ui.horizontal(|ui| {
-                if ui.button("Save & Update Keys").clicked() {
-                    let mut existing = app.groq_keys.keys();
-                    for part in app.ai.keys_input.split(['\n', ',', ';', ' ']) {
-                        let trimmed = part.trim();
-                        if trimmed.starts_with("gsk_") && !existing.contains(&trimmed.to_string()) {
-                            existing.push(trimmed.to_string());
-                        }
+                ui.label("Questions:");
+                for count in [3, 5, 10] {
+                    if ui.selectable_label(app.ai.quiz_count == count, format!("{count}")).clicked() {
+                        app.ai.quiz_count = count;
                     }
-                    app.groq_keys.set_keys(existing);
-                    app.ai.keys_input.clear();
-                }
-
-                if key_count > 0 && ui.button("Clear All Keys").clicked() {
-                    app.groq_keys.set_keys(Vec::new());
                 }
             });
+            ui.add_space(4.0);
 
-            // Display list of configured keys (masked)
-            if key_count > 0 {
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("Configured Keys:").small().font(theme::semibold(11.0)));
-                let keys = app.groq_keys.keys();
-                for (idx, k) in keys.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let masked = if k.len() > 12 {
-                            let head = &k[..6];
-                            let tail = &k[k.len().saturating_sub(4)..];
-                            format!("{head}...{tail}")
-                        } else {
-                            "gsk_******".to_string()
-                        };
-                        ui.label(egui::RichText::new(format!("Key #{}: {}", idx + 1, masked)).font(egui::FontId::monospace(11.0)));
-                        if ui.small_button("✕ Remove").clicked() {
-                            let mut updated = keys.clone();
-                            if idx < updated.len() {
-                                updated.remove(idx);
-                                app.groq_keys.set_keys(updated);
-                            }
-                        }
-                    });
+            // Difficulty Level
+            ui.horizontal(|ui| {
+                ui.label("Difficulty:");
+                if ui.selectable_label(app.ai.quiz_difficulty == QuizDifficulty::Easy, "Easy").clicked() {
+                    app.ai.quiz_difficulty = QuizDifficulty::Easy;
+                }
+                if ui.selectable_label(app.ai.quiz_difficulty == QuizDifficulty::Medium, "Medium").clicked() {
+                    app.ai.quiz_difficulty = QuizDifficulty::Medium;
+                }
+                if ui.selectable_label(app.ai.quiz_difficulty == QuizDifficulty::Hard, "Hard").clicked() {
+                    app.ai.quiz_difficulty = QuizDifficulty::Hard;
+                }
+            });
+            ui.add_space(4.0);
+
+            // Page Range
+            ui.horizontal(|ui| {
+                ui.label("From:");
+                ui.add(egui::DragValue::new(&mut app.ai.quiz_from_page).range(1..=active_pages).prefix("p. "));
+                ui.label("To:");
+                ui.add(egui::DragValue::new(&mut app.ai.quiz_to_page).range(1..=active_pages).prefix("p. "));
+
+                if ui.small_button("Current Page").clicked() {
+                    let cur = app.active_ids().and_then(|(i, _)| app.views.get(i)).map_or(1, |v| v.current + 1);
+                    app.ai.quiz_from_page = cur;
+                    app.ai.quiz_to_page = cur;
+                }
+            });
+            ui.add_space(8.0);
+
+            let btn = egui::Button::new(egui::RichText::new("🎯 Generate Questions").font(theme::semibold(13.5)).color(Color32::WHITE))
+                .fill(t.accent)
+                .min_size(vec2(ui.available_width(), 34.0));
+
+            if ui.add(btn).clicked() {
+                let s = app.ai.quiz_from_page;
+                let e = app.ai.quiz_to_page;
+                match extract_document_text(app, s, e) {
+                    Ok(text) => {
+                        let pool = app.groq_keys.clone();
+                        app.ai.request_quiz(&pool, &text);
+                    }
+                    Err(err) => {
+                        app.ai.error = Some(err);
+                    }
                 }
             }
-
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(
-                    "All keys are kept locally on your machine and rotated automatically per query to prevent rate limits.\
-                     Get free API keys at https://console.groq.com/keys"
-                )
-                .small()
-                .color(t.text_muted),
-            );
         });
 }
 
+fn render_quiz_runner(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
+    let q_idx = app.ai.quiz_current_index;
+    let total = app.ai.quiz_questions.len();
+
+    let Some(q) = app.ai.quiz_questions.get(q_idx).cloned() else {
+        app.ai.quiz_show_results = true;
+        return;
+    };
+
+    // Header: Question Counter & Type Badge
+    ui.horizontal(|ui| {
+        let badge = if app.ai.quiz_kind == QuizKind::Qcm { "QCM (Multiple)" } else { "QCS (Single)" };
+        ui.label(egui::RichText::new(format!("Question {} of {}", q_idx + 1, total)).font(theme::semibold(14.0)).color(t.text));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button("✕ Exit Quiz").clicked() {
+                app.ai.quiz_questions.clear();
+            }
+            ui.label(egui::RichText::new(badge).small().color(t.accent).font(theme::semibold(11.0)));
+        });
+    });
+
+    // Progress Bar
+    let progress = (q_idx + 1) as f32 / total as f32;
+    ui.add(egui::ProgressBar::new(progress).show_percentage());
+    ui.add_space(6.0);
+
+    // Question Prompt Box
+    egui::Frame::new()
+        .fill(t.hover)
+        .stroke(Stroke::new(1.0, t.divider))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(&q.question).font(theme::semibold(14.0)).color(t.text));
+        });
+    ui.add_space(6.0);
+
+    // Option Cards (A, B, C, D, E)
+    let is_confirmed = app.ai.quiz_is_confirmed;
+
+    for (opt_idx, opt_text) in q.options.iter().enumerate() {
+        let is_selected = app.ai.quiz_selected_options.contains(&opt_idx);
+        let is_correct_ans = q.correct.contains(&opt_idx);
+
+        let (bg, border, text_color) = if is_confirmed {
+            if is_correct_ans {
+                (Color32::from_rgba_unmultiplied(16, 185, 129, 35), Stroke::new(1.5, Color32::from_rgb(16, 185, 129)), Color32::from_rgb(16, 185, 129))
+            } else if is_selected {
+                (Color32::from_rgba_unmultiplied(239, 68, 68, 35), Stroke::new(1.5, Color32::from_rgb(239, 68, 68)), Color32::from_rgb(239, 68, 68))
+            } else {
+                (Color32::TRANSPARENT, Stroke::new(1.0, t.divider), t.text_muted)
+            }
+        } else if is_selected {
+            (t.accent_soft, Stroke::new(1.5, t.accent), t.accent)
+        } else {
+            (Color32::TRANSPARENT, Stroke::new(1.0, t.divider), t.text)
+        };
+
+        let letter = match opt_idx {
+            0 => "A",
+            1 => "B",
+            2 => "C",
+            3 => "D",
+            _ => "E",
+        };
+
+        let mark = if is_confirmed {
+            if is_correct_ans { "  ✓" } else if is_selected { "  ✗" } else { "" }
+        } else {
+            ""
+        };
+
+        let resp = egui::Frame::new()
+            .fill(bg)
+            .stroke(border)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("[{letter}]")).font(theme::bold(12.5)).color(text_color));
+                    ui.label(egui::RichText::new(format!("{opt_text}{mark}")).font(theme::regular(13.0)).color(t.text));
+                });
+            })
+            .response;
+
+        if !is_confirmed && resp.interact(egui::Sense::click()).clicked() {
+            if app.ai.quiz_kind == QuizKind::Qcs {
+                app.ai.quiz_selected_options.clear();
+                app.ai.quiz_selected_options.push(opt_idx);
+            } else if let Some(pos) = app.ai.quiz_selected_options.iter().position(|&x| x == opt_idx) {
+                app.ai.quiz_selected_options.remove(pos);
+            } else {
+                app.ai.quiz_selected_options.push(opt_idx);
+            }
+        }
+        ui.add_space(2.0);
+    }
+
+    ui.add_space(6.0);
+
+    // Explanation Box (Shown after confirmation)
+    if is_confirmed {
+        egui::Frame::new()
+            .fill(t.hover)
+            .stroke(Stroke::new(1.0, t.accent))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.add(icons::image("info", 14.0, t.accent));
+                    ui.label(egui::RichText::new("Explanation / التوضيح").font(theme::semibold(12.0)).color(t.accent));
+                });
+                ui.add_space(2.0);
+                let expl = if q.explanation.is_empty() {
+                    "Refer to the original lesson excerpt for details.".to_string()
+                } else {
+                    q.explanation.clone()
+                };
+                render_formatted_markdown(ui, &expl, t);
+            });
+        ui.add_space(6.0);
+    }
+
+    // Action Button (Confirm -> Next Question / Results)
+    if !is_confirmed {
+        let has_selection = !app.ai.quiz_selected_options.is_empty();
+        let btn = egui::Button::new(egui::RichText::new("Confirm Answer ✓").font(theme::semibold(13.5)).color(Color32::WHITE))
+            .fill(t.accent)
+            .min_size(vec2(ui.available_width(), 34.0));
+
+        if ui.add_enabled(has_selection, btn).clicked() {
+            app.ai.quiz_is_confirmed = true;
+            if let Some(slot) = app.ai.quiz_user_answers.get_mut(q_idx) {
+                *slot = app.ai.quiz_selected_options.clone();
+            }
+        }
+    } else {
+        let is_last = q_idx + 1 >= total;
+        let next_label = if is_last { "Show Final Score 🏆" } else { "Next Question ➔" };
+        let btn = egui::Button::new(egui::RichText::new(next_label).font(theme::semibold(13.5)).color(Color32::WHITE))
+            .fill(success_color(t))
+            .min_size(vec2(ui.available_width(), 34.0));
+
+        if ui.add(btn).clicked() {
+            if is_last {
+                app.ai.quiz_show_results = true;
+            } else {
+                app.ai.quiz_current_index += 1;
+                app.ai.quiz_selected_options.clear();
+                app.ai.quiz_is_confirmed = false;
+            }
+        }
+    }
+}
+
+fn render_quiz_score_card(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
+    let total = app.ai.quiz_questions.len();
+    let mut score = 0;
+
+    for (idx, q) in app.ai.quiz_questions.iter().enumerate() {
+        if let Some(user_ans) = app.ai.quiz_user_answers.get(idx) {
+            let mut correct_sorted = q.correct.clone();
+            correct_sorted.sort();
+            let mut user_sorted = user_ans.clone();
+            user_sorted.sort();
+            if correct_sorted == user_sorted {
+                score += 1;
+            }
+        }
+    }
+
+    let percentage = if total > 0 { (score * 100) / total } else { 0 };
+
+    ui.vertical_centered(|ui| {
+        ui.add_space(20.0);
+        egui::Frame::new()
+            .fill(t.hover)
+            .stroke(Stroke::new(1.5, t.accent))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("🏆 Quiz Completed!").font(theme::bold(18.0)).color(t.accent));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("{score} / {total} Correct ({percentage}%)"))
+                        .font(theme::bold(20.0))
+                        .color(if percentage >= 70 { success_color(t) } else { t.text }),
+                );
+                ui.add_space(6.0);
+
+                let verdict = if percentage >= 80 {
+                    "🌟 Excellent mastery of document content!"
+                } else if percentage >= 50 {
+                    "👍 Good job! Review the explanations to reinforce key concepts."
+                } else {
+                    "📚 Needs revision. Retake the quiz to solidify your understanding!"
+                };
+                ui.label(egui::RichText::new(verdict).color(t.text_muted));
+            });
+
+        ui.add_space(14.0);
+
+        if ui.button(egui::RichText::new("🔄 Retake Quiz").font(theme::semibold(13.0))).clicked() {
+            app.ai.quiz_current_index = 0;
+            app.ai.quiz_selected_options.clear();
+            app.ai.quiz_is_confirmed = false;
+            app.ai.quiz_show_results = false;
+            app.ai.quiz_user_answers = vec![Vec::new(); total];
+        }
+
+        ui.add_space(4.0);
+
+        if ui.button(egui::RichText::new("📝 Setup New Quiz").font(theme::semibold(13.0))).clicked() {
+            app.ai.quiz_questions.clear();
+            app.ai.quiz_show_results = false;
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
-// Text Selection "Ask AI" Button
+// Preferences Section & Ask AI Button Component
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ask_ai_button(ui: &mut egui::Ui) -> Response {
-    ui.button("✨ Ask AI")
+    let t = Tokens::get(ui.ctx());
+    ui.add(
+        egui::Button::image_and_text(icons::image("sparkles", 13.0, t.accent), "Ask AI")
+            .fill(t.accent_soft)
+            .stroke(Stroke::new(1.0, t.accent)),
+    )
+}
+
+pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
+    ui.collapsing(egui::RichText::new("✨ AI Assistant (Groq & GPT-OSS)").font(theme::semibold(14.0)), |ui| {
+        ui.add_space(4.0);
+
+        egui::Frame::new()
+            .fill(t.hover)
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                // Model Selection Dropdown
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Model:").font(theme::semibold(12.5)));
+                    for (id, label) in [
+                        ("openai/gpt-oss-120b", "GPT-OSS 120B (Recommended)"),
+                        ("openai/gpt-oss-20b", "GPT-OSS 20B (Fast)"),
+                        ("llama-3.3-70b-versatile", "Llama 3.3 70B"),
+                        ("qwen/qwen3.8-27b", "Qwen 3.8 27B"),
+                    ] {
+                        let is_active = app.ai.selected_model == id;
+                        if ui.selectable_label(is_active, label).clicked() {
+                            app.ai.selected_model = id.to_string();
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Groq API Keys (one key per line for automatic round-robin rotation):").small());
+                ui.add_space(2.0);
+
+                let edit = egui::TextEdit::multiline(&mut app.ai.keys_input)
+                    .hint_text("gsk_...\ngsk_...")
+                    .desired_rows(3)
+                    .desired_width(ui.available_width());
+
+                if ui.add(edit).changed() {
+                    let keys: Vec<String> = app.ai.keys_input
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    app.groq_keys = KeyPool::new(keys);
+                }
+
+                ui.add_space(6.0);
+
+                let key_count = app.groq_keys.count();
+                ui.horizontal(|ui| {
+                    ui.add(icons::image("shield-check", 14.0, t.accent));
+                    ui.add_space(4.0);
+                    if key_count == 0 {
+                        ui.label(egui::RichText::new("No Groq API keys configured").color(danger_color(t)));
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{key_count} active API key{} · Round-robin rotation active",
+                                if key_count > 1 { "s" } else { "" }
+                            ))
+                            .color(t.accent_text),
+                        );
+                    }
+                });
+            });
+    });
+}
+
+pub(crate) fn show(ui_ctx: &egui::Context, app: &mut PdfCraftApp) {
+    app.ai.poll();
+    if app.ai.is_streaming() {
+        ui_ctx.request_repaint();
+    }
 }
