@@ -762,9 +762,11 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                                 });
                             });
                         }
-                    });
+                    }
                 }
             });
+        }
+    });
     }
     if close {
         app.choose_right_panel(None);
