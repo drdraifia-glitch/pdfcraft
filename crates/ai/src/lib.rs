@@ -48,14 +48,15 @@ impl fmt::Display for AiError {
 // Groq Models and Constants
 // ---------------------------------------------------------------------------
 
-/// Default model: GPT-OSS 120B (fast reasoning and analysis via Groq).
-pub const DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
+/// Default model: Llama 3.3 70B (best balance of quality and speed on Groq).
+pub const DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
 
 pub const AVAILABLE_MODELS: &[(&str, &str)] = &[
-    ("openai/gpt-oss-120b", "GPT-OSS 120B (Fast, high-quality analysis)"),
-    ("openai/gpt-oss-20b", "GPT-OSS 20B (Ultra-fast, 1000 t/s)"),
-    ("llama-3.3-70b-versatile", "Llama 3.3 70B (Versatile)"),
-    ("qwen/qwen3.8-27b", "Qwen 3.8 27B (Multilingual)"),
+    ("llama-3.3-70b-versatile", "Llama 3.3 70B (Versatile — recommended)"),
+    ("meta-llama/llama-4-scout-17b-16e-instruct", "Llama 4 Scout 17B (Fast, multimodal)"),
+    ("qwen/qwen3-32b", "Qwen3 32B (Multilingual, agentic)"),
+    ("qwen-qwq-32b", "QwQ 32B (Deep reasoning)"),
+    ("llama-3.1-8b-instant", "Llama 3.1 8B (Ultra-fast)"),
 ];
 
 const GROQ_CHAT_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
