@@ -2761,6 +2761,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     let allowed = doc.allows_annotation();
     let can_copy = doc.allows_copying();
     let mut copy_selected = false;
+    let mut ask_ai_text: Option<String> = None;
     let comments_hidden = doc.comments_hidden();
     let form = doc.form.clone();
     let can_fill = doc.allows_form_filling();
@@ -3695,6 +3696,10 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
                     copy_selected = true;
                     ui.close();
                 }
+                if selected && ui.button("✨ Ask AI").clicked() {
+                    ask_ai_text = view.selected_text();
+                    ui.close();
+                }
                 ui.separator();
             }
             // Over a picture (and no comment): Copy Image, as in Acrobat's page menu.
@@ -3740,7 +3745,7 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     view.viewport_screen = out.inner_rect;
     view.auto_scroll.paint(ui, avail);
     if unobstructed && matches!(tool, QuickTool::Select | QuickTool::ColumnSelect) {
-        copy_selected |= selection_actions(ui, avail, view, info, prefs, allowed && !comments_hidden, can_copy);
+        copy_selected |= selection_actions(ui, avail, view, info, prefs, allowed && !comments_hidden, can_copy, &mut ask_ai_text);
     }
 
     // Collect all main-page demand, including cached surfaces, for byte admission later.
@@ -4068,6 +4073,9 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     if let Some((name, action)) = app.views[index].forms.button.take() {
         run_button(app, index, &name, action);
     }
+    if let Some(text) = ask_ai_text {
+        app.ai.open_with_context(text);
+    }
     if copy_selected {
         app.execute("edit.copy");
     }
@@ -4086,6 +4094,7 @@ enum SelectionAction {
     Markup(comments::CommentTool),
     Replace,
     Copy,
+    AskAi,
 }
 
 /// Actions on an existing text selection, next to the selected words.
@@ -4097,6 +4106,7 @@ fn selection_actions(
     prefs: &comments::CommentPrefs,
     can_comment: bool,
     can_copy: bool,
+    ask_ai_text: &mut Option<String>,
 ) -> bool {
     if ui.input(|input| input.pointer.is_decidedly_dragging()) {
         return false;
@@ -4139,6 +4149,9 @@ fn selection_actions(
                 if ui.add_enabled(can_copy, egui::Button::new(tl!("Copy"))).clicked() {
                     chosen = Some(SelectionAction::Copy);
                 }
+                if crate::ai_ui::ask_ai_button(ui).clicked() {
+                    chosen = Some(SelectionAction::AskAi);
+                }
             });
         });
     });
@@ -4147,6 +4160,11 @@ fn selection_actions(
         // Copying closes the bar but keeps the words selected, for ⌘C or a second action.
         view.actions_dismissed = Some(selection);
         return true;
+    }
+    if let SelectionAction::AskAi = action {
+        view.actions_dismissed = Some(selection);
+        *ask_ai_text = Some(selected.to_string());
+        return false;
     }
     let Some((page, quads)) = view.selection_quads(info) else { return false };
     let last = quads.last().copied().unwrap_or_default();

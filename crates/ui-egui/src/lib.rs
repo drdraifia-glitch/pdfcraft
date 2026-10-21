@@ -109,6 +109,7 @@ pub use print_ui::{Handling as PrintHandling, PrintDraft, PrinterSource, Which a
 mod redact_ui;
 pub use redact_ui::{HiddenDraft, PagesDraft as RedactPagesDraft, RedactPrefs, SearchDraft as RedactSearchDraft, SearchMode as RedactSearchMode};
 pub mod i18n;
+mod ai_ui;
 
 /// [`PdfCraftApp::date_text`] for callers that already borrow other parts of the app.
 pub(crate) fn date_text(session: &Session, fmt: Option<&str>) -> Result<String, String> {
@@ -814,6 +815,10 @@ pub struct PdfCraftApp {
     pub pending_full_screen: Option<DocId>,
     /// An absolute GoToR target waiting for approval, before any target-file I/O (#1364).
     pub pending_remote_link: Option<PendingRemoteLink>,
+    /// Groq API key pool for the AI assistant (Preferences ▸ AI).
+    pub groq_keys: pdfcraft_ai::KeyPool,
+    /// AI assistant panel state.
+    pub ai: ai_ui::AiState,
 }
 
 /// Where in a document a request to open an address came from.
@@ -1080,6 +1085,8 @@ impl PdfCraftApp {
             replace_draft: None,
             number_draft: NumberDraft { from: 1, to: 1, style: pdfcraft_engine::LabelStyle::Decimal, prefix: String::new(), start: 1 },
             word_count_draft: word_count_ui::Draft::default(),
+            groq_keys: Default::default(),
+            ai: Default::default(),
         }
     }
 
@@ -2309,6 +2316,8 @@ impl PdfCraftApp {
         v["redact_prefs"] = self.redact_defaults.to_json();
         // Set outside json! above, which is at serde_json's macro recursion limit.
         v["hide_empty_highlight_hover"] = serde_json::Value::Bool(self.comment_prefs.hide_empty_highlight_hover);
+        v["groq_keys"] = serde_json::to_value(self.groq_keys.keys()).unwrap_or_default();
+        v["ai_model"] = serde_json::Value::String(self.ai.selected_model.clone());
         v.to_string()
     }
 
@@ -2468,6 +2477,12 @@ impl PdfCraftApp {
         if let Ok(pems) = serde_json::from_value::<Vec<String>>(v["trusted"].clone()) {
             let certs = pems.iter().filter_map(|p| pdfcraft_engine::sign::x509::load_certificates(p.as_bytes()).ok()).flatten().collect();
             self.apply_trusted_certificates(certs);
+        }
+        if let Some(keys) = v.get("groq_keys").and_then(|k| serde_json::from_value::<Vec<String>>(k.clone()).ok()) {
+            self.groq_keys.set_keys(keys);
+        }
+        if let Some(model) = v.get("ai_model").and_then(serde_json::Value::as_str) {
+            self.ai.selected_model = model.to_string();
         }
     }
 
@@ -3153,6 +3168,7 @@ impl eframe::App for PdfCraftApp {
                 },
             );
             dialogs::show(self, &ctx);
+            ai_ui::show(&ctx, self);
             // Notices too: a refused field value or a failed save must be seen in full screen.
             self.show_progress(&ctx);
             widgets::toast(self, &ctx);
@@ -3197,6 +3213,7 @@ impl eframe::App for PdfCraftApp {
         self.process_pending_edits();
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
+        ai_ui::show(&ctx, self);
         self.show_progress(&ctx);
         widgets::toast(self, &ctx);
         self.finish_render_frame(&ctx);

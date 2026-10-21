@@ -490,6 +490,8 @@ pub(crate) fn preferences_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tok
                 .color(t.text_muted),
         );
     });
+    ui.add_space(8.0);
+    crate::ai_ui::preferences_section(ui, app, t);
     ui.add_space(10.0);
     buttons(ui, tl!("OK"), &[]).is_some()
 }

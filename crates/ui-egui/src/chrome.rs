@@ -296,6 +296,9 @@ pub fn tab_strip(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         });
                     }
                     egui::Popup::context_menu(&response).id(response.id.with("theme_menu")).show(|ui| appearance_menu(app, ui));
+                    if icons::button(ui, "sparkles", button, app.ai.open, "Ask AI Assistant").clicked() {
+                        app.ai.open = !app.ai.open;
+                    }
                     if icons::button(ui, "circle-help", button, false, tl!("Keyboard shortcuts")).clicked() {
                         app.dialog = Some(Dialog::Shortcuts);
                     }
@@ -601,6 +604,12 @@ fn main_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         ui.separator();
                     }
                     crate::commands::registry_menu(app, ui, "View");
+                    ui.separator();
+                    if ui.button(tl!("✨ Ask AI Assistant")).clicked() {
+                        app.ai.open = !app.ai.open;
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.menu_button(tl!("Display theme"), |ui| theme_menu(app, ui));
                     ui.menu_button(tl!("Side panels"), |ui| {
                         scroll_menu(ui, |ui| {
