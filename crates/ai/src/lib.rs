@@ -199,6 +199,23 @@ pub enum AiEvent {
 // Streaming Chat Execution
 // ---------------------------------------------------------------------------
 
+/// Spawn a background thread that calls Groq and returns the receiving end
+/// of the event channel. Each `AiEvent::Token` carries a text delta;
+/// `AiEvent::Done` signals a clean finish; `AiEvent::Error` carries a message.
+///
+/// This is the primary API used by the UI layer.
+pub fn stream_completion(
+    pool: KeyPool,
+    model: String,
+    messages: Vec<Message>,
+) -> std::sync::mpsc::Receiver<AiEvent> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        stream_chat(pool, model, messages, tx);
+    });
+    rx
+}
+
 /// Send a chat completion request to Groq and stream tokens back through `sender`.
 /// Rotates keys automatically and retries on rate limits (HTTP 429).
 pub fn stream_chat(

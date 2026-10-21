@@ -1540,7 +1540,7 @@ pub(crate) fn ask_ai_button(ui: &mut egui::Ui) -> Response {
 }
 
 pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
-    ui.collapsing(egui::RichText::new("✨ AI Assistant (Groq & GPT-OSS)").font(theme::semibold(14.0)), |ui| {
+    ui.collapsing(egui::RichText::new("✨ AI Assistant (Groq)").font(theme::semibold(14.0)), |ui| {
         ui.add_space(4.0);
 
         egui::Frame::new()
@@ -1553,18 +1553,14 @@ pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &
                 // Model Selection Dropdown
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Model:").font(theme::semibold(12.5)));
-                    for (id, label) in [
-                        ("openai/gpt-oss-120b", "GPT-OSS 120B (Recommended)"),
-                        ("openai/gpt-oss-20b", "GPT-OSS 20B (Fast)"),
-                        ("llama-3.3-70b-versatile", "Llama 3.3 70B"),
-                        ("qwen/qwen3.8-27b", "Qwen 3.8 27B"),
-                    ] {
-                        let is_active = app.ai.selected_model == id;
-                        if ui.selectable_label(is_active, label).clicked() {
-                            app.ai.selected_model = id.to_string();
-                        }
-                    }
                 });
+                ui.add_space(2.0);
+                for (id, label) in pdfcraft_ai::AVAILABLE_MODELS {
+                    let is_active = app.ai.selected_model == *id;
+                    if ui.selectable_label(is_active, *label).clicked() {
+                        app.ai.selected_model = (*id).to_string();
+                    }
+                }
 
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("Groq API Keys (one key per line for automatic round-robin rotation):").small());
@@ -1581,7 +1577,7 @@ pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &
                         .map(|l| l.trim().to_string())
                         .filter(|l| !l.is_empty())
                         .collect();
-                    app.groq_keys = KeyPool::new(keys);
+                    app.groq_keys.set_keys(keys);
                 }
 
                 ui.add_space(6.0);
