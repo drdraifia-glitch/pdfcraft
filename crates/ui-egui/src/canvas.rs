@@ -4194,8 +4194,8 @@ fn selection_actions(
                 author: prefs.author.clone(),
             }));
         }
-        // Copy is dispatched through the app after the view borrow ends.
-        SelectionAction::Copy => {}
+        // Copy and AskAi are dispatched through the app after the view borrow ends.
+        SelectionAction::Copy | SelectionAction::AskAi => {}
     }
     false
 }

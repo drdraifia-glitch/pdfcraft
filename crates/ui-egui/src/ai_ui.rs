@@ -503,6 +503,7 @@ pub(crate) fn show(ui_ctx: &egui::Context, app: &mut PdfCraftApp) {
 
     let t = Tokens::get(ui_ctx);
 
+    let mut is_open = app.ai.open;
     egui::Window::new("Ask AI")
         .id(egui::Id::new("pdfcraft-ai-floating-window"))
         .default_pos(Pos2::new(100.0, 100.0))
@@ -510,10 +511,11 @@ pub(crate) fn show(ui_ctx: &egui::Context, app: &mut PdfCraftApp) {
         .min_width(340.0)
         .min_height(340.0)
         .collapsible(false)
-        .open(&mut app.ai.open)
+        .open(&mut is_open)
         .show(ui_ctx, |ui| {
             render_window_body(ui, app, &t);
         });
+    app.ai.open = is_open;
 }
 
 fn danger_color(t: &Tokens) -> Color32 {
@@ -535,7 +537,7 @@ fn success_color(t: &Tokens) -> Color32 {
 fn render_window_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
     // Header & Tab Bar
     ui.horizontal(|ui| {
-        icons::paint(ui, ui.next_widget_position().to_rect(Vec2::splat(20.0)), "sparkles", 16.0, t.accent);
+        ui.add(icons::image("sparkles", 16.0, t.accent));
         ui.add_space(4.0);
         ui.label(egui::RichText::new("PdfCraft AI").font(theme::semibold(15.0)));
 
@@ -598,7 +600,7 @@ fn render_chat_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    icons::paint(ui, ui.next_widget_position().to_rect(Vec2::splat(14.0)), "file-text", 12.0, t.accent);
+                    ui.add(icons::image("file-text", 12.0, t.accent));
                     ui.add_space(2.0);
                     ui.label(egui::RichText::new("PDF Context Excerpt").small().font(theme::semibold(11.0)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -648,7 +650,7 @@ fn render_chat_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
             if app.ai.history.is_empty() && app.ai.streaming.is_none() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
-                    icons::paint(ui, ui.next_widget_position().to_rect(Vec2::splat(32.0)), "sparkles", 28.0, t.text_muted);
+                    ui.add(icons::image("sparkles", 28.0, t.text_muted));
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Select any text in the PDF and click 'Ask AI'").color(t.text_muted).italics());
                     ui.label(egui::RichText::new("or type a question below to analyze your document.").small().color(t.text_muted));
@@ -790,7 +792,7 @@ fn render_summary_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
             if app.ai.summary_result.is_empty() && !app.ai.is_summarizing {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
-                    icons::paint(ui, ui.next_widget_position().to_rect(Vec2::splat(32.0)), "file-text", 28.0, t.text_muted);
+                    ui.add(icons::image("file-text", 28.0, t.text_muted));
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("Choose a page range above and click 'Generate Summary'").color(t.text_muted).italics());
                 });
@@ -1003,11 +1005,9 @@ fn render_quiz_tab(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) {
                         );
                         ui.add_space(4.0);
 
-                        let current_answers = app.ai.quiz_selected_answers.get_mut(q_idx);
-
                         for (opt_idx, opt_text) in q.options.iter().enumerate() {
-                            let is_selected = current_answers
-                                .as_ref()
+                            let is_selected = app.ai.quiz_selected_answers
+                                .get(q_idx)
                                 .map_or(false, |ans| ans.contains(&opt_idx));
 
                             let is_correct_ans = q.correct.contains(&opt_idx);
@@ -1202,7 +1202,7 @@ pub(crate) fn preferences_section(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &
             // API keys summary
             let key_count = app.groq_keys.count();
             ui.horizontal(|ui| {
-                icons::paint(ui, ui.next_widget_position().to_rect(Vec2::splat(16.0)), "shield-check", 14.0, t.accent);
+                ui.add(icons::image("shield-check", 14.0, t.accent));
                 ui.add_space(4.0);
                 if key_count == 0 {
                     ui.label(egui::RichText::new("No Groq API keys configured").color(danger_color(t)));
