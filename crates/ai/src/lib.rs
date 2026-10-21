@@ -1,8 +1,8 @@
 //! pdfcraft-ai — Groq API client for PdfCraft's AI assistant.
 //!
-//! Manages multiple API keys with round-robin rotation, automatic failover on
-//! rate limits (HTTP 429), sends chat completions to Groq, and streams back
-//! responses token by token via an `mpsc` channel.
+//! Manages multiple API keys with round-robin rotation, 60-second cooldown on
+//! rate limits (HTTP 429), instant failover, cancellation signals, and streaming
+//! token delivery with <think> tag sanitization.
 //!
 //! # Privacy
 //! No telemetry. The only network traffic is what the user explicitly triggers
@@ -11,11 +11,12 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,9 +53,9 @@ impl fmt::Display for AiError {
 pub const DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
 
 pub const AVAILABLE_MODELS: &[(&str, &str)] = &[
-    ("llama-3.3-70b-versatile", "Llama 3.3 70B (Versatile — recommended)"),
+    ("llama-3.3-70b-versatile", "Llama 3.3 70B (Versatile — Recommended)"),
     ("meta-llama/llama-4-scout-17b-16e-instruct", "Llama 4 Scout 17B (Fast, multimodal)"),
-    ("qwen/qwen3-32b", "Qwen3 32B (Multilingual, agentic)"),
+    ("qwen/qwen3-32b", "Qwen3 32B (Multilingual, accurate)"),
     ("qwen-qwq-32b", "QwQ 32B (Deep reasoning)"),
     ("llama-3.1-8b-instant", "Llama 3.1 8B (Ultra-fast)"),
 ];
@@ -112,10 +113,35 @@ struct StreamDelta {
 }
 
 // ---------------------------------------------------------------------------
-// Key pool: multiple keys with round-robin rotation & fallback
+// Thinking Block Sanitizer (strips <think>...</think> from reasoning models)
 // ---------------------------------------------------------------------------
 
-/// A pool of Groq API keys with round-robin rotation and concurrency safety.
+pub fn strip_thinking_blocks(text: &str) -> String {
+    let mut result = text.to_string();
+    while let Some(start) = result.find("<think>") {
+        if let Some(end) = result[start..].find("</think>") {
+            result.replace_range(start..start + end + 8, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+    while let Some(start) = result.find("<thinking>") {
+        if let Some(end) = result[start..].find("</thinking>") {
+            result.replace_range(start..start + end + 11, "");
+        } else {
+            result.truncate(start);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Key pool: multiple keys with cooldown & automatic failover
+// ---------------------------------------------------------------------------
+
+/// A pool of Groq API keys with rate-limit cooldown and concurrency safety.
 #[derive(Clone, Default)]
 pub struct KeyPool {
     inner: Arc<KeyPoolInner>,
@@ -124,6 +150,7 @@ pub struct KeyPool {
 #[derive(Default)]
 struct KeyPoolInner {
     keys: Mutex<Vec<String>>,
+    cooldowns: Mutex<HashMap<String, Instant>>,
     next: AtomicUsize,
 }
 
@@ -141,6 +168,8 @@ impl KeyPool {
             .collect();
         let mut guard = self.inner.keys.lock().unwrap_or_else(|e| e.into_inner());
         *guard = cleaned;
+        let mut cd_guard = self.inner.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        cd_guard.clear();
         self.inner.next.store(0, Ordering::Relaxed);
     }
 
@@ -159,25 +188,73 @@ impl KeyPool {
         self.count() == 0
     }
 
-    /// Pick the next key in round-robin order.
-    pub fn pick(&self) -> Option<String> {
-        let guard = self.inner.keys.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_empty() {
-            return None;
-        }
-        let idx = self.inner.next.fetch_add(1, Ordering::Relaxed) % guard.len();
-        guard.get(idx).cloned()
+    /// Put a key into temporary cooldown (e.g. 60 seconds on HTTP 429).
+    pub fn mark_cooldown(&self, key: &str, duration: Duration) {
+        let mut guard = self.inner.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(key.to_string(), Instant::now() + duration);
     }
 
-    /// Pick a key with an offset (for retrying the next available keys).
-    fn pick_offset(&self, offset: usize) -> Option<String> {
-        let guard = self.inner.keys.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_empty() {
+    /// Pick the next available key that is not in cooldown.
+    /// If all keys are in cooldown, falls back to picking round-robin.
+    pub fn pick_next_available(&self) -> Option<String> {
+        let keys_guard = self.inner.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys_guard.is_empty() {
             return None;
         }
+
+        let cd_guard = self.inner.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+
+        let available: Vec<&String> = keys_guard
+            .iter()
+            .filter(|k| match cd_guard.get(*k) {
+                Some(expiry) => now >= *expiry,
+                None => true,
+            })
+            .collect();
+
+        if !available.is_empty() {
+            let idx = self.inner.next.fetch_add(1, Ordering::Relaxed) % available.len();
+            available.get(idx).map(|s| (*s).clone())
+        } else {
+            // All in cooldown: round-robin fallback across all keys
+            let idx = self.inner.next.fetch_add(1, Ordering::Relaxed) % keys_guard.len();
+            keys_guard.get(idx).cloned()
+        }
+    }
+
+    /// Pick an available key with an offset to avoid trying the same key again in a retry loop.
+    pub fn pick_offset(&self, offset: usize) -> Option<String> {
+        let keys_guard = self.inner.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys_guard.is_empty() {
+            return None;
+        }
+
+        let cd_guard = self.inner.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+
+        let available: Vec<&String> = keys_guard
+            .iter()
+            .filter(|k| match cd_guard.get(*k) {
+                Some(expiry) => now >= *expiry,
+                None => true,
+            })
+            .collect();
+
+        let pool_to_use = if available.is_empty() {
+            &*keys_guard
+        } else {
+            let cloned: Vec<String> = available.into_iter().cloned().collect();
+            return {
+                let cur = self.inner.next.load(Ordering::Relaxed);
+                let idx = cur.saturating_add(offset) % cloned.len();
+                cloned.get(idx).cloned()
+            };
+        };
+
         let cur = self.inner.next.load(Ordering::Relaxed);
-        let idx = (cur.saturating_add(offset)) % guard.len();
-        guard.get(idx).cloned()
+        let idx = cur.saturating_add(offset) % pool_to_use.len();
+        pool_to_use.get(idx).cloned()
     }
 }
 
@@ -200,29 +277,30 @@ pub enum AiEvent {
 // ---------------------------------------------------------------------------
 
 /// Spawn a background thread that calls Groq and returns the receiving end
-/// of the event channel. Each `AiEvent::Token` carries a text delta;
-/// `AiEvent::Done` signals a clean finish; `AiEvent::Error` carries a message.
-///
-/// This is the primary API used by the UI layer.
+/// of the event channel and a cancellation flag.
+/// Setting the cancellation flag to `true` stops streaming immediately.
 pub fn stream_completion(
     pool: KeyPool,
     model: String,
     messages: Vec<Message>,
-) -> std::sync::mpsc::Receiver<AiEvent> {
+) -> (std::sync::mpsc::Receiver<AiEvent>, Arc<AtomicBool>) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_thread = Arc::clone(&cancel);
     std::thread::spawn(move || {
-        stream_chat(pool, model, messages, tx);
+        stream_chat(pool, model, messages, tx, cancel_thread);
     });
-    rx
+    (rx, cancel)
 }
 
 /// Send a chat completion request to Groq and stream tokens back through `sender`.
-/// Rotates keys automatically and retries on rate limits (HTTP 429).
+/// Rotates keys automatically, cools down rate-limited keys for 60s, and checks `cancel`.
 pub fn stream_chat(
     pool: KeyPool,
     model: String,
     messages: Vec<Message>,
     sender: std::sync::mpsc::Sender<AiEvent>,
+    cancel: Arc<AtomicBool>,
 ) {
     let key_count = pool.count();
     if key_count == 0 {
@@ -235,8 +313,8 @@ pub fn stream_chat(
         model: model_to_use,
         messages: &messages,
         stream: true,
-        max_tokens: 2048,
-        temperature: 0.7,
+        max_tokens: 3072,
+        temperature: 0.3,
     };
 
     let body_json = match serde_json::to_string(&body) {
@@ -252,18 +330,28 @@ pub fn stream_chat(
     let max_tries = key_count.min(5);
 
     for attempt in 0..max_tries {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = sender.send(AiEvent::Done);
+            return;
+        }
+
         let key = match pool.pick_offset(attempt) {
             Some(k) => k,
             None => break,
         };
 
-        match try_stream_request(&key, &body_json, &sender) {
+        match try_stream_request(&key, &body_json, &sender, &cancel) {
             Ok(()) => return,
             Err(e) => {
-                log::warn!("pdfcraft-ai: attempt {} failed: {}", attempt + 1, e);
+                log::warn!("pdfcraft-ai: attempt {} with key failed: {}", attempt + 1, e);
                 last_error = e.to_string();
-                // If it's not a rate-limit/auth error (e.g. client canceled or channel closed), exit
-                if !last_error.contains("429") && !last_error.contains("401") && !last_error.contains("limit") {
+
+                if last_error.contains("429") || last_error.contains("limit") {
+                    pool.mark_cooldown(&key, Duration::from_secs(60));
+                    continue;
+                }
+
+                if !last_error.contains("401") {
                     let _ = sender.send(AiEvent::Error(last_error));
                     return;
                 }
@@ -278,6 +366,7 @@ fn try_stream_request(
     key: &str,
     body_json: &str,
     sender: &std::sync::mpsc::Sender<AiEvent>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(), AiError> {
     let agent_builder = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(45)));
 
@@ -324,10 +413,20 @@ fn try_stream_request(
     let mut line = String::new();
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = sender.send(AiEvent::Done);
+            return Ok(());
+        }
+
         line.clear();
         let bytes_read = reader.read_line(&mut line).map_err(|e| AiError::Io(e.to_string()))?;
         if bytes_read == 0 {
             break;
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            let _ = sender.send(AiEvent::Done);
+            return Ok(());
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -383,14 +482,16 @@ pub fn system_prompt(selected_text: &str) -> Message {
     } else {
         format!(
             "\n\nContext excerpt from the open PDF:\n\"\"\"\n{}\n\"\"\"\n\
-             Answer questions regarding this excerpt accurately and concisely.",
+             Answer questions regarding this excerpt accurately, thoroughly, and concisely.",
             selected_text.trim()
         )
     };
 
     Message::system(format!(
-        "You are an expert AI assistant embedded in PdfCraft, an open-source PDF application.\
-         Help the user understand, summarize, explain, and extract insights from their document.\
-         Be concise, precise, and polite. Respond in the language used by the user.{context}"
+        "You are an expert, multilingual academic and educational AI assistant embedded in PdfCraft.\
+         Help the user understand, summarize, explain, and extract insights from their PDF document.\
+         Be concise, precise, and polite. Always respond in the exact language used by the user (Arabic, French, or English).\
+         Format mathematical and scientific expressions cleanly using standard Markdown and LaTeX math delimiters.\
+         Do not include meta-reasoning, scratchpads, or <think> tags in your final answer.{context}"
     ))
 }
